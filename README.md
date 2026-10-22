@@ -18,6 +18,14 @@ This project uses CMake, and is properly configured to build on both Linux and W
 ```
 sudo apt-get install xorg-dev libgl-dev
 ```
+The vendored GLFW needs the X11 extension headers in particular (Xrandr, Xinerama, Xcursor, Xi); `xorg-dev` covers all of them. On other distros:
+```
+# Fedora / RHEL
+sudo dnf install libXrandr-devel libXinerama-devel libXcursor-devel libXi-devel mesa-libGL-devel
+# Arch
+sudo pacman -S xorgproto libxrandr libxinerama libxcursor libxi mesa
+```
+`Could NOT find Doxygen` at configure time is harmless (only used for GLFW's own docs). CMake 4.x is supported out of the box; CMake < 4 needs nothing special either.
 Most Ubuntu distributions should include all other dependencies, and Windows should not require any other dependencies. GLEW, GLFW, Eigen, GLM, and IMGUI are all built from source in this project, and are included as git submodules. You'll need to run `git pull --recurse-submodules` to pull them down. `mkdir` a `./build/` directory, and then run `cmake ..` in that directory and compile with `make`.
 
 ## Demo application
