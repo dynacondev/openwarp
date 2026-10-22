@@ -31,8 +31,15 @@ class Openwarp::OpenwarpApplication{
     const uint32_t HEIGHT = 1024;
 
     public:
-        OpenwarpApplication(size_t meshSize = 1024);
+        enum class Backend {
+            OpenGL,
+            Vulkan,
+        };
+
+        OpenwarpApplication(size_t meshSize = 1024, Backend backend = Backend::OpenGL);
         ~OpenwarpApplication();
+
+        Backend GetBackend() const { return backend; }
 
         void Run(bool showGUI);
 
@@ -54,6 +61,13 @@ class Openwarp::OpenwarpApplication{
         bool showMeshConfig = true;
         bool showRayConfig = true;
         bool useVsync = false;
+
+        // Rendering backend selected via --vulkan. OpenGL is the full
+        // demo path; Vulkan routes mesh warping through the Vulkan
+        // compute warp (Option B port of the dynacon splat/pull warp).
+        // Raymarch is unavailable in Vulkan mode.
+        Backend backend = Backend::OpenGL;
+        bool vulkanModeLogged = false;
 
         // Application resources
         ObjScene demoscene;

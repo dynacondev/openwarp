@@ -22,10 +22,21 @@ using namespace Openwarp;
 
 OpenwarpApplication* OpenwarpApplication::instance;
 
-OpenwarpApplication::OpenwarpApplication(size_t meshSize){
+OpenwarpApplication::OpenwarpApplication(size_t meshSize, Backend backend_) : backend(backend_){
 
     // For static callbacks.
     OpenwarpApplication::instance = this;
+
+    if (backend == Backend::Vulkan) {
+        std::cout << "Initializing Openwarp [Vulkan compute-warp backend requested]" << std::endl;
+#ifndef OPENWARP_HAS_VULKAN
+        std::cerr << "WARNING: --vulkan requested but this binary was built without Vulkan support; "
+                     "falling back to the OpenGL mesh path until the Vulkan backend lands."
+                  << std::endl;
+#endif
+        // Raymarch has no Vulkan port (mesh warp only).
+        useRay = false;
+    }
 
     std::cout << "Initializing Openwarp";
     std::cout << "Initializing GLFW...." << std::endl;
@@ -176,6 +187,14 @@ void OpenwarpApplication::RunTest(const TestRun& testRun, std::string runDir, bo
 }
 
 void OpenwarpApplication::Run(bool showGUI){
+    if (backend == Backend::Vulkan && !vulkanModeLogged) {
+        vulkanModeLogged = true;
+        std::cout << "[vulkan] backend active (scaffold): scene still renders via GL; "
+                     "mesh warp routes to Vulkan compute once the warp module lands "
+                     "(commit 2). Raymarch disabled in this mode." << std::endl;
+        // Raymarch is GL-only; never raymarch under --vulkan.
+        useRay = false;
+    }
     while(!glfwWindowShouldClose(window)) {
 
         glfwPollEvents();
@@ -365,6 +384,20 @@ void OpenwarpApplication::processInput(){
 }
 
 void OpenwarpApplication::doReprojection(bool useRay){
+
+    // Scaffold: the Vulkan compute warp module (commit 2) will take over
+    // the mesh path here. Until then, fall through to the GL mesh warp so
+    // --vulkan stays runnable and comparable frame-to-frame.
+    if(backend == Backend::Vulkan) {
+        if(useRay) {
+            std::cerr << "[vulkan] raymarch requested in Vulkan mode; forcing mesh warp." << std::endl;
+        }
+        useRay = false;
+        if(!vulkanModeLogged) {
+            vulkanModeLogged = true;
+            std::cout << "[vulkan] scaffold: using GL mesh warp until VulkanWarp lands." << std::endl;
+        }
+    }
 
     if(useRay) {
         glBindVertexArray(rayProgram.vao);

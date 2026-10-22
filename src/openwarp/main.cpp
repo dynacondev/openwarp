@@ -21,13 +21,16 @@ int main(int argc, char *argv[]) {
     "  -step         Specify the step size of the automated test run. If this is\n"
     "                specified, you also need to specify -disp.\n"
     "  -output       Specify the output directory for the automated test run. If\n"
-    "                this is specified, you also need to specify -disp and -step.\n";
+    "                this is specified, you also need to specify -disp and -step.\n"
+    "  -vulkan       Use the Vulkan compute warp backend (mesh warp via Vulkan\n"
+    "                compute; raymarch is unavailable in this mode).\n";
 
     bool doTestRun = false;
     float displacement = 0;
     float stepSize = 0;
     size_t meshSize = 1024;
     bool showGUI = true;
+    bool useVulkan = false;
     std::string outputDir = "../output";
 
     for(size_t i = 0; i < args.size(); i++){
@@ -39,6 +42,10 @@ int main(int argc, char *argv[]) {
 
         if(args[i].rfind("-nogui") == 0){
             showGUI = false;
+        }
+
+        if(args[i] == "-vulkan"){
+            useVulkan = true;
         }
 
         if(args[i].rfind("-mesh") == 0){
@@ -91,7 +98,9 @@ int main(int argc, char *argv[]) {
     if((displacement == 0 || stepSize == 0) && doTestRun)
         throw std::runtime_error("Usage: Neither stepSize nor displacement can be zero, if provided.");
 
-    OpenwarpApplication app = OpenwarpApplication(meshSize);
+    OpenwarpApplication::Backend backend = useVulkan ? OpenwarpApplication::Backend::Vulkan
+                                                         : OpenwarpApplication::Backend::OpenGL;
+    OpenwarpApplication app = OpenwarpApplication(meshSize, backend);
 
     if(doTestRun) {
         TestRun test = TestRun(displacement, stepSize, outputDir);

@@ -67,3 +67,18 @@ target_link_libraries(openwarp PRIVATE libglew_static)
 add_subdirectory(include/glm EXCLUDE_FROM_ALL)
 target_link_libraries(openwarp PRIVATE glm)
 
+# Vulkan compute warp backend (optional -- build stays GL-only without it).
+# The Vulkan SDK provides headers + loader; the backend itself lands in
+# src/openwarp/vulkan/ (commit 2) and is compiled only when found.
+option(OPENWARP_ENABLE_VULKAN "Build with Vulkan compute warp backend (needs Vulkan SDK)" ON)
+if(OPENWARP_ENABLE_VULKAN)
+    find_package(Vulkan QUIET)
+    if(Vulkan_FOUND)
+        message(STATUS "Vulkan ${Vulkan_VERSION} found - enabling --vulkan backend scaffold")
+        target_compile_definitions(openwarp PRIVATE OPENWARP_HAS_VULKAN=1)
+        target_link_libraries(openwarp PRIVATE Vulkan::Vulkan)
+    else()
+        message(STATUS "Vulkan not found - building GL-only; --vulkan will fall back with a warning")
+    endif()
+endif()
+
