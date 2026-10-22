@@ -1,5 +1,14 @@
 cmake_minimum_required(VERSION 3.10)
 
+# Vendored 2020-era submodules (glfw/glm/glew-cmake) declare
+# cmake_minimum_required(< 3.5), which CMake >= 4.0 rejects. Keep the pins
+# (tested combo) and opt into the 3.5 compat floor instead of updating deps.
+# No-op on CMake < 4. Equivalent to configuring with
+# -DCMAKE_POLICY_VERSION_MINIMUM=3.5. Remove when submodules are bumped.
+if(NOT DEFINED CMAKE_POLICY_VERSION_MINIMUM)
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "Compat floor for vendored pre-3.5 submodules")
+endif()
+
 
 
 project(openwarp)
