@@ -55,6 +55,24 @@ optional arguments:
                 ./openwarp-vulkan-test.
 ```
 
+### GPU selection (`--vulkan`)
+
+The warp reads back the GL-rendered frame, so GL and Vulkan should live
+on the **same GPU** — a split (e.g. GL on Intel + Vulkan on NVIDIA, common
+on Optimus laptops) forces every frame over PCIe twice and hitches. The
+backend picks automatically: it prefers the Vulkan device matching the GL
+vendor (`GL_VENDOR`), with discrete-GPU preference as tiebreak. Override:
+```
+OPENWARP_VK_DEVICE=1 ./openwarp -vulkan   # pick Vulkan device 1 (see init log)
+```
+To run everything on the NVIDIA dGPU instead (highest headroom):
+```
+__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia ./openwarp -vulkan
+# (Arch: prime-run ./openwarp -vulkan)
+```
+With GL on NVIDIA, Vulkan auto-follows — no override needed. A mismatch
+warning is logged when both APIs end up on different vendors.
+
 ## Analysis
 
 The SSIM (structural similary index metric) of the reprojection algorithms can be analyzed in an automated fashion with the `ssim.py` script located in the `./analysis` folder. This will run Openwarp with an automated test configuration, and collect + dump reprojected frames. It performs SSIM analysis on each frame position and plots the SSIM in 3D space, with respect to the three-DoF displacement of the head pose with respect to the rendered frame's pose. The usage of the `ssim.py` script can be seen as follows:

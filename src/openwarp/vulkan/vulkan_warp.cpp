@@ -8,6 +8,7 @@
 #include <Eigen/Dense>
 
 #include <cmath>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -356,7 +357,8 @@ bool VulkanWarp::Fail(std::string* error, const std::string& msg)
 	return false;
 }
 
-bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir, std::string* error)
+bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir, std::string* error,
+                    const char* glRenderer)
 {
 	if (initialized_)
 		Shutdown();
@@ -402,10 +404,34 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 		return false;
 	std::cout << "[vulkan] validation " << (layerCount ? "ON" : "off") << std::endl;
 
-	// Physical device: prefer discrete GPU (the GL demo usually runs
-	// there; picking the first enumerated device lands on the iGPU on
-	// Optimus laptops and forces every frame over PCIe twice).
-	// OPENWARP_VK_DEVICE=<index> overrides.
+	// Physical device: follow the GL renderer when known (same GPU for
+	// both APIs => frames never cross PCIe), discrete GPU as tiebreak,
+	// OPENWARP_VK_DEVICE=<index> as final override.
+	auto lower = [](const std::string& in) {
+		std::string v(in);
+		for (auto& c : v)
+			c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+		return v;
+	};
+	auto rendererMatches = [&](uint32_t vendorId, const char* deviceName) {
+		if (!glRenderer || !glRenderer[0] || !deviceName)
+			return false;
+		std::string r = lower(glRenderer);
+		std::string d = lower(deviceName);
+		// Direct containment either way (llvmpipe, Mesa Intel/AMD with
+		// near-identical strings).
+		if (r.find(d) != std::string::npos || d.find(r) != std::string::npos)
+			return true;
+		auto has = [&](const char* t) { return r.find(t) != std::string::npos; };
+		switch (vendorId) {
+		case 0x10de: return has("nvidia") || has("geforce") || has("quadro") || has("tesla");
+		case 0x8086: return has("intel") || has("uhd") || has("iris") || has("hd graphics");
+		case 0x1002: return has("amd") || has("radeon");
+		default: return false;
+		}
+	};
+	if (glRenderer && glRenderer[0])
+		std::cout << "[vulkan] GL renderer hint: " << glRenderer << std::endl;
 	uint32_t devCount = 0;
 	if (!Check(vkEnumeratePhysicalDevices(s->instance, &devCount, nullptr),
 	           "vkEnumeratePhysicalDevices", error) ||
@@ -455,7 +481,19 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 		          << (fam >= 0 ? ", compute ok" : ", NO compute queue") << ")" << std::endl;
 		if (fam < 0)
 			continue;
-		int score = (forcedIdx == static_cast<int>(di)) ? 100 : devScore(props.deviceType);
+		// Explicit override wins; otherwise a GL-renderer match dominates
+		// and the discrete preference only breaks ties within a vendor.
+		int score = devScore(props.deviceType);
+		const char* why = "type";
+		if (rendererMatches(props.vendorID, props.deviceName)) {
+			score += 100;
+			why = "GL-renderer match";
+		}
+		if (forcedIdx == static_cast<int>(di)) {
+			score = 1000;
+			why = "OPENWARP_VK_DEVICE override";
+		}
+		std::cout << "[vulkan]   -> score " << score << " (" << why << ")" << std::endl;
 		if (score > bestScore) {
 			bestScore = score;
 			best = static_cast<int>(di);

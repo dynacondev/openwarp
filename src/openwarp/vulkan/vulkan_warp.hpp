@@ -58,8 +58,12 @@ public:
 
 	// Loads warp_splat.spv / warp_pull.spv from spvDir, creates the
 	// device, images and pipelines. Returns false on failure (with the
-	// reason in *error when non-null).
-	bool Init(uint32_t width, uint32_t height, const std::string& spvDir, std::string* error = nullptr);
+	// reason in *error when non-null). glRenderer (from
+	// glGetString(GL_RENDERER), may be null) steers device selection
+	// toward the GPU the GL context runs on so both APIs share one
+	// device and frames never cross PCIe.
+	bool Init(uint32_t width, uint32_t height, const std::string& spvDir, std::string* error = nullptr,
+	          const char* glRenderer = nullptr);
 	bool IsInitialized() const { return initialized_; }
 	void Shutdown();
 

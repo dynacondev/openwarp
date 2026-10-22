@@ -430,7 +430,9 @@ bool OpenwarpApplication::EnsureVulkanWarp()
 
     vulkanWarp = std::make_unique<openwarp_vk::VulkanWarp>();
     std::string error;
-    if(!vulkanWarp->Init(WIDTH, HEIGHT, spvDir, &error)) {
+    const char* glRendererForVk =
+        reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+    if(!vulkanWarp->Init(WIDTH, HEIGHT, spvDir, &error, glRendererForVk)) {
         std::cerr << "[vulkan] VulkanWarp::Init failed: " << error << "; disabling." << std::endl;
         vulkanWarp.reset();
         vulkanFailed = true;
