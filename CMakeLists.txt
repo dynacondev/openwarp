@@ -77,6 +77,57 @@ if(OPENWARP_ENABLE_VULKAN)
         message(STATUS "Vulkan ${Vulkan_VERSION} found - enabling --vulkan backend scaffold")
         target_compile_definitions(openwarp PRIVATE OPENWARP_HAS_VULKAN=1)
         target_link_libraries(openwarp PRIVATE Vulkan::Vulkan)
+
+        # Compile the compute warp shaders to SPIR-V at build time.
+        find_program(OPENWARP_GLSLC glslc)
+        if(NOT OPENWARP_GLSLC)
+            message(WARNING "glslc not found - Vulkan warp shaders will not be built")
+        else()
+            set(OPENWARP_SPV_DIR "${CMAKE_BINARY_DIR}/openwarp-shaders")
+            file(MAKE_DIRECTORY "${OPENWARP_SPV_DIR}")
+            set(OPENWARP_SPV
+                "${OPENWARP_SPV_DIR}/warp_splat.spv"
+                "${OPENWARP_SPV_DIR}/warp_pull.spv")
+            add_custom_command(
+                OUTPUT "${OPENWARP_SPV_DIR}/warp_splat.spv"
+                COMMAND "${OPENWARP_GLSLC}" --target-env=vulkan1.0 -O
+                        "${CMAKE_CURRENT_SOURCE_DIR}/resources/shaders/vulkan/warp_splat.comp"
+                        -o "${OPENWARP_SPV_DIR}/warp_splat.spv"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/resources/shaders/vulkan/warp_splat.comp"
+                COMMENT "Compiling warp_splat.comp")
+            add_custom_command(
+                OUTPUT "${OPENWARP_SPV_DIR}/warp_pull.spv"
+                COMMAND "${OPENWARP_GLSLC}" --target-env=vulkan1.0 -O
+                        "${CMAKE_CURRENT_SOURCE_DIR}/resources/shaders/vulkan/warp_pull.comp"
+                        -o "${OPENWARP_SPV_DIR}/warp_pull.spv"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/resources/shaders/vulkan/warp_pull.comp"
+                COMMENT "Compiling warp_pull.comp")
+            add_custom_target(openwarp_vulkan_shaders ALL DEPENDS ${OPENWARP_SPV})
+
+            # Headless compute warp library (Option B port).
+            add_library(openwarp_vulkan STATIC
+                src/openwarp/vulkan/vulkan_warp.cpp
+                src/openwarp/vulkan/vulkan_warp.hpp)
+            target_include_directories(openwarp_vulkan PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/openwarp"
+                include/eigen)
+            target_link_libraries(openwarp_vulkan PRIVATE Vulkan::Vulkan)
+            set_property(TARGET openwarp_vulkan PROPERTY CXX_STANDARD 17)
+            add_dependencies(openwarp_vulkan openwarp_vulkan_shaders)
+            target_link_libraries(openwarp PRIVATE openwarp_vulkan)
+            target_compile_definitions(openwarp PRIVATE
+                "OPENWARP_SPV_DIR_DEFAULT=\"${OPENWARP_SPV_DIR}\"")
+
+            # Headless test: synthetic warp on lavapipe, no window needed.
+            add_executable(openwarp-vulkan-test
+                src/openwarp/vulkan/vulkan_warp_test.cpp)
+            target_include_directories(openwarp-vulkan-test PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/openwarp"
+                include/eigen)
+            target_link_libraries(openwarp-vulkan-test PRIVATE openwarp_vulkan stdc++fs)
+            set_property(TARGET openwarp-vulkan-test PROPERTY CXX_STANDARD 17)
+            add_dependencies(openwarp-vulkan-test openwarp_vulkan_shaders)
+        endif()
     else()
         message(STATUS "Vulkan not found - building GL-only; --vulkan will fall back with a warning")
     endif()

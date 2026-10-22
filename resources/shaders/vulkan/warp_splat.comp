@@ -1,0 +1,67 @@
+/*
+ * Openwarp Vulkan compute warp, pass 1 (splat).
+ *
+ * Part of the Openwarp project, NCSA licensed (see LICENSE).
+ *
+ * One thread per source pixel: unproject with the render (source)
+ * inverse matrices, reproject to the target pose, and keep the nearest
+ * (foreground) depth at each target pixel with an atomic min.
+ *
+ * Warp math follows the OpenWarp family
+ * (https://github.com/Zee2/openwarp, NCSA-licensed).
+ */
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D srcDepth;
+
+layout(set = 0, binding = 1) uniform SplatUBO
+{
+	mat4 renderInvVP; // source clip -> world (inverse view * inverse projection, folded on CPU)
+	mat4 warpVP; // target projection * target view, folded on CPU
+} ubo;
+
+layout(set = 0, binding = 2, r32ui) uniform coherent uimage2D dstSplat;
+
+#define DEPTH_SCALE 16777215.0
+
+void main()
+{
+	ivec2 srcXY = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 size = imageSize(dstSplat);
+	if (srcXY.x >= size.x || srcXY.y >= size.y)
+		return;
+
+	vec2 guv = (vec2(srcXY) + vec2(0.5)) / vec2(size);
+
+	// Source depth is standard 0..1 nonlinear.
+	float z = texture(srcDepth, guv).x;
+
+	vec4 clip = vec4(guv * 2.0 - 1.0, z * 2.0 - 1.0, 1.0);
+	vec4 world = ubo.renderInvVP * clip;
+	vec4 target = ubo.warpVP * world;
+
+	// Behind the target camera: nothing to splat (the sign must be
+	// tested before the perspective divide destroys it).
+	if (target.w <= 0.0)
+		return;
+	target /= target.w;
+	// Outside the target frustum in depth: without this reject the
+	// out-of-range pixels splat clamped garbage.
+	if (target.z < -1.0 || target.z > 1.0)
+		return;
+
+	vec2 tuv = target.xy * 0.5 + 0.5;
+	if (tuv.x < 0.0 || tuv.x > 1.0 || tuv.y < 0.0 || tuv.y > 1.0)
+		return;
+
+	ivec2 dstXY = clamp(ivec2(tuv * vec2(size)), ivec2(0), size - ivec2(1));
+	// Encode TARGET-view depth: the pull side unprojects through the
+	// target inverses, and atomicMin must order contributors by target
+	// depth or occlusion resolves wrong under motion.
+	float zt = target.z * 0.5 + 0.5;
+	uint enc = uint(clamp(zt, 0.0, 1.0) * DEPTH_SCALE);
+	imageAtomicMin(dstSplat, dstXY, enc);
+}
