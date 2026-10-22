@@ -24,8 +24,6 @@ layout(set = 0, binding = 1) uniform PullUBO
 {
 	mat4 dstInv; // target clip -> world (inverse view * inverse projection, folded on CPU)
 	mat4 srcVP; // source projection * source view, folded on CPU
-	// .x is the max expanding-ring radius for hole fill (0 = black).
-	vec4 holeAndPad;
 } ubo;
 
 layout(set = 0, binding = 2, r32ui) uniform uimage2D splatDepth;
@@ -71,43 +69,11 @@ void main()
 			ok = true;
 	}
 
-	if (!ok) {
-		// Expanding-ring search for the nearest valid splat. Each ring
-		// covers the perimeter only, so cost grows with the hole edge,
-		// not its area. Keeps the DEEPEST candidate in the nearest
-		// non-empty ring (background stretch): the nearest valid splat
-		// to a disocclusion is usually the occluding foreground edge,
-		// and smearing it reads as fringing.
-		int rmax = int(ubo.holeAndPad.x + 0.5);
-		vec2 bestSuv = vec2(0.0);
-		float bestDepth = -1.0;
-		for (int r = 1; r <= rmax && bestDepth < 0.0; r++) {
-			for (int dy = -r; dy <= r; dy++) {
-				for (int dx = -r; dx <= r; dx++) {
-					if (max(abs(dx), abs(dy)) != r)
-						continue;
-					ivec2 nxy = dstXY + ivec2(dx, dy);
-					if (nxy.x < 0 || nxy.y < 0 || nxy.x >= size.x || nxy.y >= size.y)
-						continue;
-					uint nenc = imageLoad(splatDepth, nxy).x;
-					if (nenc == SPLAT_EMPTY)
-						continue;
-					float ndepth = float(nenc) / DEPTH_SCALE;
-					vec2 nsuv = vec2(0.0);
-					vec2 nuv = (vec2(nxy) + vec2(0.5)) / vec2(size);
-					if (ndepth > bestDepth && sourceUV(nuv, ndepth, nsuv) && inBounds(nsuv)) {
-						bestSuv = nsuv;
-						bestDepth = ndepth;
-					}
-				}
-			}
-		}
-		if (bestDepth >= 0.0) {
-			suv = bestSuv;
-			ok = true;
-		}
-	}
-
+	// No hole search here: disoccluded pixels keep black, and the
+	// optional pyramid fill pass (warp_fill.comp) patches them with a
+	// local average afterwards. The old expanding-ring search grew with
+	// hole width (up to 80 taps/px at radius 4) and smeared the
+	// foreground edge across the gap.
 	if (!ok) {
 		imageStore(dstColor, dstXY, vec4(0.0));
 		return;

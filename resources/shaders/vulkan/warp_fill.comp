@@ -1,0 +1,53 @@
+/*
+ * Openwarp Vulkan compute warp, pass 4 (pyramid hole fill).
+ *
+ * Part of the Openwarp project, NCSA licensed (see LICENSE).
+ *
+ * Patches pixels the pull pass left black (no valid splat) with the
+ * local average from the validity-weighted coarse pyramid: blurred
+ * fill, never stretched. Constant cost per hole pixel (<=2 taps) no
+ * matter how wide the disocclusion is.
+ */
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba8) uniform image2D dstImg;
+layout(set = 0, binding = 1, r32ui) uniform uimage2D splatDepth;
+layout(set = 0, binding = 2) uniform sampler2D coarse0; // 1/8 res local average
+layout(set = 0, binding = 3) uniform sampler2D coarse1; // 1/64 res local average
+layout(set = 0, binding = 4) uniform sampler2D coarse2; // whole-frame average
+
+#define SPLAT_EMPTY 0xffffffffu
+#define VALID_EPS 1e-4
+
+void main()
+{
+	ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 size = imageSize(dstImg);
+	if (xy.x >= size.x || xy.y >= size.y)
+		return;
+	// Valid pixels keep the pull result untouched.
+	if (imageLoad(splatDepth, xy).x != SPLAT_EMPTY)
+		return;
+
+	vec2 tuv = (vec2(xy) + vec2(0.5)) / vec2(size);
+	vec4 c0 = texture(coarse0, tuv);
+	if (c0.a > VALID_EPS) {
+		imageStore(dstImg, xy, vec4(c0.rgb / c0.a, 1.0));
+		return;
+	}
+	vec4 c1 = texture(coarse1, tuv);
+	if (c1.a > VALID_EPS) {
+		imageStore(dstImg, xy, vec4(c1.rgb / c1.a, 1.0));
+		return;
+	}
+	// Whole-frame average: fills anything unless the frame is empty.
+	vec4 c2 = texture(coarse2, tuv);
+	if (c2.a > VALID_EPS) {
+		imageStore(dstImg, xy, vec4(c2.rgb / c2.a, 1.0));
+		return;
+	}
+	// Nothing valid anywhere: stays black.
+}

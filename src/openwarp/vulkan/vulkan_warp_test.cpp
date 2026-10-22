@@ -142,6 +142,49 @@ int main(int argc, char** argv)
 		ok = false;
 	}
 
+	// Test 4: pyramid fill. Same shifted warp with fill enabled: the
+	// disoccluded square interior must be patched with a local average
+	// (far fewer pure-black pixels than the unfilled run above), while
+	// valid pixels stay bit-identical to the unfilled result.
+	if (!warp.Upload(color.data(), depth.data())) {
+		std::cerr << "refill Upload failed" << std::endl;
+		return 1;
+	}
+	std::vector<uint8_t> shiftFilled;
+	if (!warp.Warp(identity, proj, shifted, proj, 1.0f, shiftFilled, true)) {
+		std::cerr << "filled Warp() failed" << std::endl;
+		return 1;
+	}
+	double filledBlack = BlackFraction(shiftFilled);
+	std::cout << "[filled] blackFrac=" << filledBlack << " (unfilled was " << blackFrac << ")"
+	          << std::endl;
+	if (!(filledBlack < 0.15 && filledBlack < blackFrac * 0.5)) {
+		std::cerr << "FAIL: pyramid fill did not reduce black (filled<0.15, halved required)"
+		          << std::endl;
+		ok = false;
+	}
+	{
+		// Valid pixels must be untouched by the fill pass.
+		double validDiff = 0.0;
+		size_t validCount = 0;
+		for (size_t i = 0; i < shiftOut.size(); i++) {
+			bool wasBlack = (shiftOut[i] == 0);
+			if (!wasBlack) {
+				validDiff += std::abs(static_cast<int>(shiftOut[i]) -
+				                       static_cast<int>(shiftFilled[i]));
+				validCount++;
+			}
+		}
+		validDiff /= validCount ? static_cast<double>(validCount) : 1.0;
+		std::cout << "[filled] valid-pixel meanAbsDiff=" << validDiff << std::endl;
+		if (!(validDiff < 1e-6)) {
+			std::cerr << "FAIL: fill pass altered valid pixels" << std::endl;
+			ok = false;
+		}
+	}
+	stbi_write_png((outDir + "/shifted_filled.png").c_str(), kSize, kSize, 4, shiftFilled.data(),
+	               kSize * 4);
+
 	stbi_write_png((outDir + "/input.png").c_str(), kSize, kSize, 4, color.data(), kSize * 4);
 	stbi_write_png((outDir + "/identity.png").c_str(), kSize, kSize, 4, idOut.data(), kSize * 4);
 	stbi_write_png((outDir + "/shifted.png").c_str(), kSize, kSize, 4, shiftOut.data(),

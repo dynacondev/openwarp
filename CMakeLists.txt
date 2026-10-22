@@ -96,7 +96,10 @@ if(OPENWARP_ENABLE_VULKAN)
             file(MAKE_DIRECTORY "${OPENWARP_SPV_DIR}")
             set(OPENWARP_SPV
                 "${OPENWARP_SPV_DIR}/warp_splat.spv"
-                "${OPENWARP_SPV_DIR}/warp_pull.spv")
+                "${OPENWARP_SPV_DIR}/warp_pull.spv"
+                "${OPENWARP_SPV_DIR}/warp_coarse0.spv"
+                "${OPENWARP_SPV_DIR}/warp_coarse1.spv"
+                "${OPENWARP_SPV_DIR}/warp_fill.spv")
             add_custom_command(
                 OUTPUT "${OPENWARP_SPV_DIR}/warp_splat.spv"
                 COMMAND "${OPENWARP_GLSLC}" --target-env=vulkan1.0 -O
@@ -111,6 +114,27 @@ if(OPENWARP_ENABLE_VULKAN)
                         -o "${OPENWARP_SPV_DIR}/warp_pull.spv"
                 DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/resources/shaders/vulkan/warp_pull.comp"
                 COMMENT "Compiling warp_pull.comp")
+            add_custom_command(
+                OUTPUT "${OPENWARP_SPV_DIR}/warp_coarse0.spv"
+                COMMAND "${OPENWARP_GLSLC}" --target-env=vulkan1.0 -O -DLEVEL=0
+                        "${CMAKE_CURRENT_SOURCE_DIR}/resources/shaders/vulkan/warp_coarse.comp"
+                        -o "${OPENWARP_SPV_DIR}/warp_coarse0.spv"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/resources/shaders/vulkan/warp_coarse.comp"
+                COMMENT "Compiling warp_coarse.comp (L0)")
+            add_custom_command(
+                OUTPUT "${OPENWARP_SPV_DIR}/warp_coarse1.spv"
+                COMMAND "${OPENWARP_GLSLC}" --target-env=vulkan1.0 -O -DLEVEL=1
+                        "${CMAKE_CURRENT_SOURCE_DIR}/resources/shaders/vulkan/warp_coarse.comp"
+                        -o "${OPENWARP_SPV_DIR}/warp_coarse1.spv"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/resources/shaders/vulkan/warp_coarse.comp"
+                COMMENT "Compiling warp_coarse.comp (L1)")
+            add_custom_command(
+                OUTPUT "${OPENWARP_SPV_DIR}/warp_fill.spv"
+                COMMAND "${OPENWARP_GLSLC}" --target-env=vulkan1.0 -O
+                        "${CMAKE_CURRENT_SOURCE_DIR}/resources/shaders/vulkan/warp_fill.comp"
+                        -o "${OPENWARP_SPV_DIR}/warp_fill.spv"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/resources/shaders/vulkan/warp_fill.comp"
+                COMMENT "Compiling warp_fill.comp")
             add_custom_target(openwarp_vulkan_shaders ALL DEPENDS ${OPENWARP_SPV})
 
             # Headless compute warp library (Option B port).

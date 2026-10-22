@@ -1,0 +1,63 @@
+/*
+ * Openwarp Vulkan compute warp, pass 3 (coarse pyramid build).
+ *
+ * Part of the Openwarp project, NCSA licensed (see LICENSE).
+ *
+ * Builds the validity-weighted average pyramid used for hole filling:
+ * each coarse texel stores sum-of-valid-colors + valid-count so a later
+ * tap can normalize to a local average (blurred fill, never stretched).
+ * Compiled twice with -DLEVEL=0 (pull output + splat -> L0) and
+ * -DLEVEL=1 (L0 -> L1).
+ */
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+#define SPLAT_EMPTY 0xffffffffu
+
+#if LEVEL == 0
+layout(set = 0, binding = 0) uniform sampler2D srcColor;
+layout(set = 0, binding = 1, r32ui) uniform uimage2D splatDepth;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D coarseOut;
+#else
+// NOTE: output lives at binding 1 here (not 2): the coarse1 layout is
+// (sampled, storage) and every shader binding must exist in the layout.
+// An unbound storage write is silently discarded, which zeroed L1.
+layout(set = 0, binding = 0) uniform sampler2D coarseIn;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D coarseOut;
+#endif
+
+void main()
+{
+	ivec2 outXY = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 outSize = imageSize(coarseOut);
+	if (outXY.x >= outSize.x || outXY.y >= outSize.y)
+		return;
+
+	vec3 sum = vec3(0.0);
+	float cnt = 0.0;
+	ivec2 base = outXY * 8;
+	for (int y = 0; y < 8; y++) {
+		for (int x = 0; x < 8; x++) {
+			ivec2 pxy = base + ivec2(x, y);
+#if LEVEL == 0
+			ivec2 srcSize = imageSize(splatDepth);
+			if (pxy.x >= srcSize.x || pxy.y >= srcSize.y)
+				continue;
+			if (imageLoad(splatDepth, pxy).x != SPLAT_EMPTY) {
+				sum += texelFetch(srcColor, pxy, 0).rgb;
+				cnt += 1.0;
+			}
+#else
+			ivec2 srcSize = textureSize(coarseIn, 0);
+			if (pxy.x >= srcSize.x || pxy.y >= srcSize.y)
+				continue;
+			vec4 t = texelFetch(coarseIn, pxy, 0);
+			sum += t.rgb;
+			cnt += t.a;
+#endif
+		}
+	}
+	imageStore(coarseOut, outXY, vec4(sum, cnt));
+}

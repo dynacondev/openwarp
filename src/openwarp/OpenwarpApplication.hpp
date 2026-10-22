@@ -143,12 +143,16 @@ class Openwarp::OpenwarpApplication{
             double presentMs = 0.0;
             double gpuSplatMs = 0.0;
             double gpuPullMs = 0.0;
+            double gpuFillMs = 0.0;
             double gpuCopyMs = 0.0;
             uint64_t gpuTimedWarps = 0;
             float lastCoverage = -1.0f;
         } vulkanStats;
         bool vulkanDepthLogged = false;
         uint64_t vulkanDumpCount = 0;
+        // Pyramid hole fill: >0 enables (blurred local-average fill of
+        // disocclusions, constant cost/hole). 0 leaves them black.
+        float vulkanHoleFill = 1.0f;
         double vulkanStatsLastLog = 0.0;
         bool EnsureVulkanWarp();
         bool doVulkanMeshWarp();

@@ -556,12 +556,13 @@ bool OpenwarpApplication::doVulkanMeshWarp()
     std::memcpy(srcProj, projection.data(), sizeof(srcProj));
     std::memcpy(dstProj, projection.data(), sizeof(dstProj));
 
-    // Hole fill OFF (radius 0): unknown pixels stay black. The radius-4
-    // expanding-ring search costs up to 80 taps per hole pixel and
-    // dominates the pull pass on large disocclusions.
+    // Hole fill: pyramid local-average of valid neighbors (blurred,
+    // never stretched). 0 = honest black for A/B. The old
+    // expanding-ring search grew with hole width and smeared edges.
     // Coverage is sampled (1/60 warps): same-submit copy, negligible cost.
     bool wantCoverage = (vulkanStats.warps % 60) == 0;
-    if(!vulkanWarp->Warp(srcPose, srcProj, dstPose, dstProj, 0.0f, vulkanOut, wantCoverage)) {
+    if(!vulkanWarp->Warp(srcPose, srcProj, dstPose, dstProj, vulkanHoleFill, vulkanOut,
+                         wantCoverage)) {
         std::cerr << "[vulkan] Warp failed (" << vulkanWarp->LastError() << "); disabling."
                   << std::endl;
         vulkanFailed = true;
@@ -578,6 +579,7 @@ bool OpenwarpApplication::doVulkanMeshWarp()
         if(gpu.valid) {
             vulkanStats.gpuSplatMs += gpu.splatMs;
             vulkanStats.gpuPullMs += gpu.pullMs;
+            vulkanStats.gpuFillMs += gpu.fillMs;
             vulkanStats.gpuCopyMs += gpu.clearMs + gpu.copyMs;
             vulkanStats.gpuTimedWarps++;
         }
@@ -697,6 +699,7 @@ bool OpenwarpApplication::doVulkanMeshWarp()
         if(vulkanStats.gpuTimedWarps) {
             std::cout << " | gpu splat=" << vulkanStats.gpuSplatMs / g
                       << " pull=" << vulkanStats.gpuPullMs / g
+                      << " fill=" << vulkanStats.gpuFillMs / g
                       << " copies=" << vulkanStats.gpuCopyMs / g;
         } else {
             std::cout << " | gpu timestamps off";
@@ -706,7 +709,8 @@ bool OpenwarpApplication::doVulkanMeshWarp()
         vulkanStats.warps = vulkanStats.uploads = vulkanStats.skips = 0;
         vulkanStats.readbackMs = vulkanStats.uploadMs = vulkanStats.warpMs = vulkanStats.presentMs =
             0.0;
-        vulkanStats.gpuSplatMs = vulkanStats.gpuPullMs = vulkanStats.gpuCopyMs = 0.0;
+        vulkanStats.gpuSplatMs = vulkanStats.gpuPullMs = vulkanStats.gpuFillMs =
+            vulkanStats.gpuCopyMs = 0.0;
         vulkanStats.gpuTimedWarps = 0;
     }
     return true;
