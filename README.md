@@ -39,6 +39,12 @@ optional arguments:
                 specified, you also need to specify -disp.
   -output       Specify the output directory for the automated test run. If
                 this is specified, you also need to specify -disp and -step.
+  -vulkan       Use the Vulkan compute warp backend (mesh warp via Vulkan
+                compute; raymarch is unavailable in this mode). Needs the
+                Vulkan SDK at build time and warp_splat.spv / warp_pull.spv
+                (built by CMake into openwarp-shaders/, overridable with
+                OPENWARP_SPV_DIR). A headless self-test is available as
+                ./openwarp-vulkan-test.
 ```
 
 ## Analysis

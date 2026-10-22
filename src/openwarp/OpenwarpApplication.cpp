@@ -5,6 +5,7 @@
 #include <string>
 #include <fstream>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 namespace fs = std::filesystem;
 #include <iostream>
@@ -189,9 +190,8 @@ void OpenwarpApplication::RunTest(const TestRun& testRun, std::string runDir, bo
 void OpenwarpApplication::Run(bool showGUI){
     if (backend == Backend::Vulkan && !vulkanModeLogged) {
         vulkanModeLogged = true;
-        std::cout << "[vulkan] backend active (scaffold): scene still renders via GL; "
-                     "mesh warp routes to Vulkan compute once the warp module lands "
-                     "(commit 2). Raymarch disabled in this mode." << std::endl;
+        std::cout << "[vulkan] backend active: GL scene render, mesh warp on Vulkan compute "
+                     "(raymarch disabled in this mode)." << std::endl;
         // Raymarch is GL-only; never raymarch under --vulkan.
         useRay = false;
     }
@@ -383,20 +383,173 @@ void OpenwarpApplication::processInput(){
     }
 }
 
+#ifdef OPENWARP_HAS_VULKAN
+bool OpenwarpApplication::EnsureVulkanWarp()
+{
+    if(vulkanWarp && vulkanWarp->IsInitialized())
+        return true;
+    if(vulkanFailed)
+        return false;
+
+    // Locate the warp SPIR-V: env override, build-time default, then
+    // common relative layouts.
+    std::vector<std::string> dirs;
+    if(const char* env = std::getenv("OPENWARP_SPV_DIR"))
+        dirs.emplace_back(env);
+#ifdef OPENWARP_SPV_DIR_DEFAULT
+    dirs.emplace_back(OPENWARP_SPV_DIR_DEFAULT);
+#endif
+    dirs.emplace_back("../openwarp-shaders");
+    dirs.emplace_back("./openwarp-shaders");
+    std::string spvDir;
+    for(auto& d : dirs) {
+        std::ifstream probe(d + "/warp_splat.spv", std::ios::binary);
+        if(probe) {
+            spvDir = d;
+            break;
+        }
+    }
+    if(spvDir.empty()) {
+        std::cerr << "[vulkan] no warp SPIR-V found (set OPENWARP_SPV_DIR); disabling." << std::endl;
+        vulkanFailed = true;
+        return false;
+    }
+
+    vulkanWarp = std::make_unique<openwarp_vk::VulkanWarp>();
+    std::string error;
+    if(!vulkanWarp->Init(WIDTH, HEIGHT, spvDir, &error)) {
+        std::cerr << "[vulkan] VulkanWarp::Init failed: " << error << "; disabling." << std::endl;
+        vulkanWarp.reset();
+        vulkanFailed = true;
+        return false;
+    }
+    std::cout << "[vulkan] compute warp ready (" << WIDTH << "x" << HEIGHT << ", spv: " << spvDir
+              << ")" << std::endl;
+    return true;
+}
+
+bool OpenwarpApplication::doVulkanMeshWarp()
+{
+    if(!EnsureVulkanWarp())
+        return false;
+
+    // Read back the GL-rendered scene. renderScene leaves renderFBO
+    // bound; row 0 here is the frustum bottom for both planes, which is
+    // exactly the row order the warp math assumes (clip y = guv*2-1).
+    std::vector<uint8_t> color(static_cast<size_t>(WIDTH) * HEIGHT * 4);
+    std::vector<float> depth(static_cast<size_t>(WIDTH) * HEIGHT);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, renderFBO);
+    glReadPixels(0, 0, WIDTH, HEIGHT, GL_RGBA, GL_UNSIGNED_BYTE, color.data());
+    glReadPixels(0, 0, WIDTH, HEIGHT, GL_DEPTH_COMPONENT, GL_FLOAT, depth.data());
+
+    if(!vulkanWarp->Upload(color.data(), depth.data())) {
+        std::cerr << "[vulkan] warp Upload failed; disabling." << std::endl;
+        vulkanFailed = true;
+        return false;
+    }
+
+    // Source = rendered pose, target = current pose; same projection.
+    // renderedCameraMatrix is camera-to-world (Translation * Rotation),
+    // matching VulkanWarp::Pose (view = its inverse).
+    openwarp_vk::Pose srcPose{};
+    {
+        Eigen::Vector3f t = renderedCameraMatrix.block<3, 1>(0, 3);
+        Eigen::Quaternionf q(renderedCameraMatrix.block<3, 3>(0, 0));
+        srcPose.pos[0] = t.x();
+        srcPose.pos[1] = t.y();
+        srcPose.pos[2] = t.z();
+        srcPose.quat[0] = q.x();
+        srcPose.quat[1] = q.y();
+        srcPose.quat[2] = q.z();
+        srcPose.quat[3] = q.w();
+    }
+    openwarp_vk::Pose dstPose{};
+    dstPose.pos[0] = position.x();
+    dstPose.pos[1] = position.y();
+    dstPose.pos[2] = position.z();
+    dstPose.quat[0] = orientation.x();
+    dstPose.quat[1] = orientation.y();
+    dstPose.quat[2] = orientation.z();
+    dstPose.quat[3] = orientation.w();
+    openwarp_vk::Mat4 srcProj{};
+    openwarp_vk::Mat4 dstProj{};
+    std::memcpy(srcProj, projection.data(), sizeof(srcProj));
+    std::memcpy(dstProj, projection.data(), sizeof(dstProj));
+
+    std::vector<uint8_t> out;
+    if(!vulkanWarp->Warp(srcPose, srcProj, dstPose, dstProj, 4.0f, out)) {
+        std::cerr << "[vulkan] warp failed; disabling." << std::endl;
+        vulkanFailed = true;
+        return false;
+    }
+
+    // Present the warped result with a trivial GL textured quad.
+    if(vulkanPresentTex == 0) {
+        glGenTextures(1, &vulkanPresentTex);
+        glBindTexture(GL_TEXTURE_2D, vulkanPresentTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, WIDTH, HEIGHT, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                     nullptr);
+        vulkanPresentProgram =
+            init_and_link("../resources/shaders/present.vert", "../resources/shaders/present.frag");
+        // Fullscreen triangle strip: xy + uv.
+        const float quad[16] = {-1, -1, 0, 0, 1, -1, 1, 0, -1, 1, 0, 1, 1, 1, 1, 1};
+        glGenVertexArrays(1, &vulkanPresentVAO);
+        glBindVertexArray(vulkanPresentVAO);
+        glGenBuffers(1, &vulkanPresentVBO);
+        glBindBuffer(GL_ARRAY_BUFFER, vulkanPresentVBO);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+    }
+    glBindTexture(GL_TEXTURE_2D, vulkanPresentTex);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, WIDTH, HEIGHT, GL_RGBA, GL_UNSIGNED_BYTE, out.data());
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, WIDTH, HEIGHT);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glUseProgram(vulkanPresentProgram);
+    GLint texLoc = glGetUniformLocation(vulkanPresentProgram, "present_tex");
+    if(texLoc >= 0) {
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, vulkanPresentTex);
+        glUniform1i(texLoc, 0);
+    }
+    glBindVertexArray(vulkanPresentVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, vulkanPresentVBO);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glBindVertexArray(0);
+    return true;
+}
+#endif // OPENWARP_HAS_VULKAN
+
 void OpenwarpApplication::doReprojection(bool useRay){
 
-    // Scaffold: the Vulkan compute warp module (commit 2) will take over
-    // the mesh path here. Until then, fall through to the GL mesh warp so
-    // --vulkan stays runnable and comparable frame-to-frame.
     if(backend == Backend::Vulkan) {
-        if(useRay) {
-            std::cerr << "[vulkan] raymarch requested in Vulkan mode; forcing mesh warp." << std::endl;
-        }
+        // Raymarch is GL-only; never raymarch under --vulkan.
         useRay = false;
+#ifdef OPENWARP_HAS_VULKAN
+        // The Vulkan compute warp IS the mesh warp in this mode.
+        if(doVulkanMeshWarp())
+            return;
+        // Fell through: Vulkan unavailable/failed, use the GL mesh path
+        // so the demo stays alive and frame-comparable.
         if(!vulkanModeLogged) {
             vulkanModeLogged = true;
-            std::cout << "[vulkan] scaffold: using GL mesh warp until VulkanWarp lands." << std::endl;
+            std::cout << "[vulkan] warp unavailable, falling back to GL mesh warp." << std::endl;
         }
+#else
+        if(!vulkanModeLogged) {
+            vulkanModeLogged = true;
+            std::cout << "[vulkan] binary built without Vulkan support; using GL mesh warp." << std::endl;
+        }
+#endif
     }
 
     if(useRay) {

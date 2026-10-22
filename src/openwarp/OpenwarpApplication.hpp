@@ -19,7 +19,11 @@
 #include <cstdint>
 #include <algorithm>
 #include <cstring>
-#include <cstdint>
+#include <memory>
+
+#ifdef OPENWARP_HAS_VULKAN
+#include "vulkan/vulkan_warp.hpp"
+#endif
 
 #include "openwarp.hpp"
 #include "util/obj.hpp"
@@ -100,6 +104,22 @@ class Openwarp::OpenwarpApplication{
         bool shouldRenderScene = true;
         bool shouldReproject = true;
         bool useRay = false;
+
+#ifdef OPENWARP_HAS_VULKAN
+        // Vulkan compute warp state (Option B). The GL scene still
+        // renders into renderFBO; each frame is read back, warped on the
+        // Vulkan compute queue, and presented from a GL texture. Lazily
+        // initialized; vulkanFailed latches a GL-mesh fallback so the
+        // demo stays usable where no Vulkan driver exists.
+        std::unique_ptr<openwarp_vk::VulkanWarp> vulkanWarp;
+        bool vulkanFailed = false;
+        GLuint vulkanPresentTex = 0;
+        GLint vulkanPresentProgram = 0;
+        GLuint vulkanPresentVAO = 0;
+        GLuint vulkanPresentVBO = 0;
+        bool EnsureVulkanWarp();
+        bool doVulkanMeshWarp();
+#endif
 
         double lastSwapTime;
         double presentationFramerate;
