@@ -149,6 +149,12 @@ struct VulkanWarp::State {
 	VkPipeline splatPipe = VK_NULL_HANDLE;
 	VkPipeline pullPipe = VK_NULL_HANDLE;
 
+	// Optional GPU timestamp queries (stage timing). Created when the
+	// queue family supports them; all use is guarded by hasTimestamps.
+	VkQueryPool queryPool = VK_NULL_HANDLE;
+	bool hasTimestamps = false;
+	double timestampPeriodMs = 0.0;
+
 	bool srcUploaded = false;
 };
 
@@ -558,7 +564,10 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 	sci.magFilter = VK_FILTER_LINEAR;
 	sci.minFilter = VK_FILTER_LINEAR;
 	sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-	sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+	// Color sampler: linear, edge-clamped. Out-of-bounds taps are
+	// already rejected in-shader (inBounds), so border-black would only
+	// darken the valid 1-px rim where linear filtering touches the edge.
+	sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
 	sci.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
 	if (!Check(vkCreateSampler(s->device, &sci, nullptr, &s->colorSampler), "color sampler", error))
 		return false;
@@ -726,6 +735,34 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 	if (!makePipe(pullSpv, s->pullLayout, s->pullPipeLayout, s->pullPipe, "pull pipeline"))
 		return false;
 
+	// Timestamp queries: 0 submit-start, 1 after clear, 2 after splat,
+	// 3 after pull, 4 after dst copy. Optional; guarded everywhere.
+	{
+		uint32_t qCount = 0;
+		vkGetPhysicalDeviceQueueFamilyProperties(s->phys, &qCount, nullptr);
+		std::vector<VkQueueFamilyProperties> qps(qCount);
+		if (qCount > 0)
+			vkGetPhysicalDeviceQueueFamilyProperties(s->phys, &qCount, qps.data());
+		if (s->queueFamily < qps.size() && qps[s->queueFamily].timestampValidBits > 0) {
+			VkPhysicalDeviceProperties devProps{};
+			vkGetPhysicalDeviceProperties(s->phys, &devProps);
+			s->timestampPeriodMs = devProps.limits.timestampPeriod / 1e6;
+			VkQueryPoolCreateInfo qi{};
+			qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+			qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+			qi.queryCount = 5;
+			if (Check(vkCreateQueryPool(s->device, &qi, nullptr, &s->queryPool),
+			          "timestamp query pool", nullptr)) {
+				s->hasTimestamps = true;
+			}
+		}
+		if (s->hasTimestamps)
+			std::cout << "[vulkan] GPU timestamps available (period "
+			          << s->timestampPeriodMs << " ms/tick)" << std::endl;
+		else
+			std::cout << "[vulkan] GPU timestamps unavailable (stage times off)" << std::endl;
+	}
+
 	width_ = width;
 	height_ = height;
 	initialized_ = true;
@@ -739,6 +776,8 @@ void VulkanWarp::Shutdown()
 	State* s = state_;
 	if (s->device) {
 		vkDeviceWaitIdle(s->device);
+		if (s->queryPool)
+			vkDestroyQueryPool(s->device, s->queryPool, nullptr);
 		if (s->splatPipe)
 			vkDestroyPipeline(s->device, s->splatPipe, nullptr);
 		if (s->pullPipe)
@@ -862,6 +901,10 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 
 	if (!BeginOnce(s, &lastError_))
 		return false;
+	if (s->hasTimestamps) {
+		vkCmdResetQueryPool(s->cmd, s->queryPool, 0, 5);
+		vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s->queryPool, 0);
+	}
 
 	// Splat scratch: clear to "empty" every warp, then splat.
 	Transition(s, s->splat, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -874,6 +917,8 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 	VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 	vkCmdClearColorImage(s->cmd, s->splat.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1,
 	                     &range);
+	if (s->hasTimestamps)
+		vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 1);
 	Transition(s, s->splat, VK_IMAGE_LAYOUT_GENERAL,
 	           VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
 	           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
@@ -888,6 +933,8 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 	vkCmdBindDescriptorSets(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s->splatPipeLayout, 0, 1,
 	                        &s->splatSet, 0, nullptr);
 	vkCmdDispatch(s->cmd, gx, gy, 1);
+	if (s->hasTimestamps)
+		vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 2);
 
 	// Splat writes (atomics) visible to pull reads: same queue.
 	VkMemoryBarrier memBar{};
@@ -901,6 +948,8 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 	vkCmdBindDescriptorSets(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s->pullPipeLayout, 0, 1,
 	                        &s->pullSet, 0, nullptr);
 	vkCmdDispatch(s->cmd, gx, gy, 1);
+	if (s->hasTimestamps)
+		vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 3);
 
 	// Read back dst (and the splat plane for coverage, same submit).
 	Transition(s, s->dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
@@ -923,6 +972,8 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 		vkCmdCopyImageToBuffer(s->cmd, s->splat.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 		                       s->staging.handle, 1, &copySplat);
 	}
+	if (s->hasTimestamps)
+		vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 4);
 	if (!SubmitWait(s, &lastError_)) {
 		if (lastError_.empty())
 			lastError_ = "Warp: submit/wait failed";
@@ -930,6 +981,21 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 	}
 	outColor.resize(static_cast<size_t>(colorBytes));
 	std::memcpy(outColor.data(), s->staging.mapped, static_cast<size_t>(colorBytes));
+
+	// GPU stage times (fence already waited, so results are ready).
+	lastGpu_ = GpuTimes{};
+	if (s->hasTimestamps) {
+		uint64_t ts[5] = {};
+		if (vkGetQueryPoolResults(s->device, s->queryPool, 0, 5, sizeof(ts), ts, sizeof(uint64_t),
+		                          VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) ==
+		    VK_SUCCESS) {
+			lastGpu_.valid = true;
+			lastGpu_.clearMs = (ts[1] - ts[0]) * s->timestampPeriodMs;
+			lastGpu_.splatMs = (ts[2] - ts[1]) * s->timestampPeriodMs;
+			lastGpu_.pullMs = (ts[3] - ts[2]) * s->timestampPeriodMs;
+			lastGpu_.copyMs = (ts[4] - ts[3]) * s->timestampPeriodMs;
+		}
+	}
 
 	// Coverage: count non-empty splat texels from the same submit.
 	if (countCoverage) {
@@ -943,6 +1009,7 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 				filled++;
 		}
 		lastCoverage_ = total ? static_cast<float>(filled) / static_cast<float>(total) : 0.0f;
+		lastSplat_.assign(words, words + total);
 	}
 	(void)kDepthScale;
 	return true;

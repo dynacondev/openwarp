@@ -146,6 +146,33 @@ int main(int argc, char** argv)
 	stbi_write_png((outDir + "/identity.png").c_str(), kSize, kSize, 4, idOut.data(), kSize * 4);
 	stbi_write_png((outDir + "/shifted.png").c_str(), kSize, kSize, 4, shiftOut.data(),
 	               kSize * 4);
+
+	// Test 3: far-plane regression. Flat depth-1.0 (sky) scene, target
+	// backs away: without the z<=0.995 clamp the background's
+	// reprojected depth exceeds 1.0 and the frame goes black.
+	std::vector<uint8_t> flatColor(kSize * kSize * 4, 200);
+	std::vector<float> flatDepth(kSize * kSize, 1.0f);
+	if (!warp.Upload(flatColor.data(), flatDepth.data())) {
+		std::cerr << "flat Upload failed" << std::endl;
+		return 1;
+	}
+	openwarp_vk::Pose backed = identity;
+	backed.pos[2] = -0.2f;
+	std::vector<uint8_t> backedOut;
+	if (!warp.Warp(identity, proj, backed, proj, 0.0f, backedOut, true)) {
+		std::cerr << "backed Warp() failed" << std::endl;
+		return 1;
+	}
+	float backedCov = warp.LastCoverage();
+	double backedBlack = BlackFraction(backedOut);
+	std::cout << "[backed] coverage=" << backedCov << " blackFrac=" << backedBlack << std::endl;
+	if (!(backedCov > 0.9 && backedBlack < 0.1)) {
+		std::cerr << "FAIL: far-plane background dropped (cov>0.9, black<0.1 required)"
+		          << std::endl;
+		ok = false;
+	}
+	stbi_write_png((outDir + "/backed.png").c_str(), kSize, kSize, 4, backedOut.data(),
+	               kSize * 4);
 	std::cout << (ok ? "VULKAN WARP TEST: PASS" : "VULKAN WARP TEST: FAIL") << std::endl;
 	return ok ? 0 : 1;
 }

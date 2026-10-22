@@ -5,6 +5,7 @@
 #include <string>
 #include <fstream>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 namespace fs = std::filesystem;
@@ -511,6 +512,17 @@ bool OpenwarpApplication::doVulkanMeshWarp()
         }
         vulkanStats.uploads++;
         lastWarpRenderSeq = renderSeq;
+        if(!vulkanDepthLogged) {
+            vulkanDepthLogged = true;
+            float mn = vulkanDepth[0];
+            float mx = vulkanDepth[0];
+            for(float d : vulkanDepth) {
+                mn = std::min(mn, d);
+                mx = std::max(mx, d);
+            }
+            std::cout << "[vulkan] uploaded depth range [" << mn << ", " << mx
+                      << "] (sky/clear pixels should sit at 1.0)" << std::endl;
+        }
     }
     double tUpload = nowMs();
 
@@ -559,6 +571,51 @@ bool OpenwarpApplication::doVulkanMeshWarp()
     lastWarpQuat = orientation;
     if(wantCoverage)
         vulkanStats.lastCoverage = vulkanWarp->LastCoverage();
+    {
+        openwarp_vk::VulkanWarp::GpuTimes gpu = vulkanWarp->LastGpuTimes();
+        if(gpu.valid) {
+            vulkanStats.gpuSplatMs += gpu.splatMs;
+            vulkanStats.gpuPullMs += gpu.pullMs;
+            vulkanStats.gpuCopyMs += gpu.clearMs + gpu.copyMs;
+            vulkanStats.gpuTimedWarps++;
+        }
+    }
+    // Debug dumps (validity-mask discriminator for spurious black):
+    // OPENWARP_VK_DUMP=1 writes the warped frame + splat-validity mask as
+    // raw PPM/PGM on coverage-sampled warps. No image dependency.
+    if(wantCoverage && std::getenv("OPENWARP_VK_DUMP")) {
+        char base[64];
+        std::snprintf(base, sizeof(base), "vulkan-dump-%04llu",
+                      (unsigned long long)vulkanDumpCount++);
+        {
+            std::ofstream f(std::string(base) + ".ppm", std::ios::binary);
+            f << "P6\n" << WIDTH << " " << HEIGHT << "\n255\n";
+            std::vector<char> row(WIDTH * 3);
+            for(uint32_t y = 0; y < HEIGHT; y++) {
+                for(uint32_t x = 0; x < WIDTH; x++) {
+                    size_t i = static_cast<size_t>(y) * WIDTH + x;
+                    row[3 * x + 0] = static_cast<char>(vulkanOut[4 * i + 0]);
+                    row[3 * x + 1] = static_cast<char>(vulkanOut[4 * i + 1]);
+                    row[3 * x + 2] = static_cast<char>(vulkanOut[4 * i + 2]);
+                }
+                f.write(row.data(), row.size());
+            }
+        }
+        const std::vector<uint32_t>& splat = vulkanWarp->LastSplatPlane();
+        if(splat.size() == px) {
+            std::ofstream f(std::string(base) + "-mask.pgm", std::ios::binary);
+            f << "P5\n" << WIDTH << " " << HEIGHT << "\n255\n";
+            std::vector<char> row(WIDTH);
+            for(uint32_t y = 0; y < HEIGHT; y++) {
+                for(uint32_t x = 0; x < WIDTH; x++) {
+                    size_t i = static_cast<size_t>(y) * WIDTH + x;
+                    row[x] = (splat[i] != 0xffffffffu) ? char(255) : char(0);
+                }
+                f.write(row.data(), row.size());
+            }
+        }
+        std::cout << "[vulkan] wrote " << base << ".ppm + mask" << std::endl;
+    }
     double tWarp = nowMs();
 
     // Present the warped result with a trivial GL textured quad.
@@ -573,13 +630,19 @@ bool OpenwarpApplication::doVulkanMeshWarp()
                      nullptr);
         vulkanPresentProgram =
             init_and_link("../resources/shaders/present.vert", "../resources/shaders/present.frag");
-        // Fullscreen triangle strip: xy + uv.
+        // Fullscreen triangle strip: xy + uv. Attrib setup lives in the
+        // VAO once; the hot path only binds the VAO.
         const float quad[16] = {-1, -1, 0, 0, 1, -1, 1, 0, -1, 1, 0, 1, 1, 1, 1, 1};
         glGenVertexArrays(1, &vulkanPresentVAO);
         glBindVertexArray(vulkanPresentVAO);
         glGenBuffers(1, &vulkanPresentVBO);
         glBindBuffer(GL_ARRAY_BUFFER, vulkanPresentVBO);
         glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+        glBindVertexArray(0);
     }
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glBindTexture(GL_TEXTURE_2D, vulkanPresentTex);
@@ -605,11 +668,8 @@ bool OpenwarpApplication::doVulkanMeshWarp()
         glUniform1i(vulkanPresentTexLoc, 0);
     }
     glBindVertexArray(vulkanPresentVAO);
-    glBindBuffer(GL_ARRAY_BUFFER, vulkanPresentVBO);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+    // (VAO holds the fullscreen-quad attrib setup from creation; no
+    // per-warp vertex setup needed.)
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glBindVertexArray(0);
     double tPresent = nowMs();
@@ -620,17 +680,32 @@ bool OpenwarpApplication::doVulkanMeshWarp()
     vulkanStats.presentMs += (tPresent - tWarp);
 
     // Paced profiling: proves the Vulkan pipeline renders + shows where
-    // time goes (rendering vs shading vs copies). Every ~2 s.
+    // time goes (rendering vs shading vs copies). Per-interval means
+    // (reset each print) so trends/slopes are readable; the cumulative
+    // alternative hides them. Every ~2 s.
     if(tPresent - vulkanStatsLastLog > 2000.0) {
         vulkanStatsLastLog = tPresent;
         uint64_t n = vulkanStats.warps ? vulkanStats.warps : 1;
+        uint64_t g = vulkanStats.gpuTimedWarps ? vulkanStats.gpuTimedWarps : 1;
         std::cout << "[vulkan] stats: warps=" << vulkanStats.warps
                   << " uploads=" << vulkanStats.uploads << " skips=" << vulkanStats.skips
                   << " | ms/warp readback=" << vulkanStats.readbackMs / n
-                  << " upload=" << vulkanStats.uploadMs / n << " gpu-warp=" << vulkanStats.warpMs / n
-                  << " present=" << vulkanStats.presentMs / n
-                  << " | coverage=" << vulkanStats.lastCoverage
+                  << " upload=" << vulkanStats.uploadMs / n << " cpu-warp=" << vulkanStats.warpMs / n
+                  << " present=" << vulkanStats.presentMs / n;
+        if(vulkanStats.gpuTimedWarps) {
+            std::cout << " | gpu splat=" << vulkanStats.gpuSplatMs / g
+                      << " pull=" << vulkanStats.gpuPullMs / g
+                      << " copies=" << vulkanStats.gpuCopyMs / g;
+        } else {
+            std::cout << " | gpu timestamps off";
+        }
+        std::cout << " | coverage=" << vulkanStats.lastCoverage
                   << " | present-fps=" << presentationFramerate << std::endl;
+        vulkanStats.warps = vulkanStats.uploads = vulkanStats.skips = 0;
+        vulkanStats.readbackMs = vulkanStats.uploadMs = vulkanStats.warpMs = vulkanStats.presentMs =
+            0.0;
+        vulkanStats.gpuSplatMs = vulkanStats.gpuPullMs = vulkanStats.gpuCopyMs = 0.0;
+        vulkanStats.gpuTimedWarps = 0;
     }
     return true;
 }

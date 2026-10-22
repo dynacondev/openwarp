@@ -92,6 +92,21 @@ public:
 	// Name of the selected physical device (empty until Init succeeds).
 	const std::string& DeviceName() const { return deviceName_; }
 
+	// GPU stage times from the last Warp (valid=false when timestamp
+	// queries are unsupported). Splat/pull shader cost vs copies.
+	struct GpuTimes {
+		bool valid = false;
+		double clearMs = 0.0;
+		double splatMs = 0.0;
+		double pullMs = 0.0;
+		double copyMs = 0.0;
+	};
+	GpuTimes LastGpuTimes() const { return lastGpu_; }
+
+	// Raw splat plane (R32_UINT encodings) from the last Warp with
+	// countCoverage=true; empty otherwise. For validity-mask dumps.
+	const std::vector<uint32_t>& LastSplatPlane() const { return lastSplat_; }
+
 private:
 	bool Fail(std::string* error, const std::string& msg);
 
@@ -99,6 +114,8 @@ private:
 	uint32_t height_ = 0;
 	bool initialized_ = false;
 	float lastCoverage_ = -1.0f;
+	GpuTimes lastGpu_{};
+	std::vector<uint32_t> lastSplat_;
 	std::string lastError_;
 	std::string deviceName_;
 

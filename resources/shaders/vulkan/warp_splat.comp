@@ -39,6 +39,13 @@ void main()
 	// Source depth is standard 0..1 nonlinear.
 	float z = texture(srcDepth, guv).x;
 
+	// Far-plane clamp (mesh parity: openwarp_mesh.vert clamps NDC z to
+	// 0.99, i.e. window depth 0.995). Sky/clear pixels sit at exactly
+	// 1.0; without this, any backward motion pushes their reprojected
+	// target.z past 1.0 and the frustum reject below drops the whole
+	// background to black.
+	z = min(z, 0.995);
+
 	vec4 clip = vec4(guv * 2.0 - 1.0, z * 2.0 - 1.0, 1.0);
 	vec4 world = ubo.renderInvVP * clip;
 	vec4 target = ubo.warpVP * world;

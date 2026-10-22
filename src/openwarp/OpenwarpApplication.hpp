@@ -131,6 +131,8 @@ class Openwarp::OpenwarpApplication{
         Eigen::Vector3f lastWarpPos = Eigen::Vector3f::Zero();
         Eigen::Quaternionf lastWarpQuat = Eigen::Quaternionf::Identity();
         // Paced profiling: per-stage CPU ms + counts, logged every ~2 s.
+        // gpu*Ms are device times from timestamp queries (when available);
+        // the cpu gpu-warp number includes submit/wait + PCIe + memcpys.
         struct VulkanStats {
             uint64_t warps = 0;
             uint64_t uploads = 0;
@@ -139,8 +141,14 @@ class Openwarp::OpenwarpApplication{
             double uploadMs = 0.0;
             double warpMs = 0.0;
             double presentMs = 0.0;
+            double gpuSplatMs = 0.0;
+            double gpuPullMs = 0.0;
+            double gpuCopyMs = 0.0;
+            uint64_t gpuTimedWarps = 0;
             float lastCoverage = -1.0f;
         } vulkanStats;
+        bool vulkanDepthLogged = false;
+        uint64_t vulkanDumpCount = 0;
         double vulkanStatsLastLog = 0.0;
         bool EnsureVulkanWarp();
         bool doVulkanMeshWarp();
