@@ -7,6 +7,7 @@
 
 #include <Eigen/Dense>
 
+#include <algorithm>
 #include <cmath>
 #include <cctype>
 #include <cstdlib>
@@ -128,16 +129,14 @@ struct VulkanWarp::State {
 		VkDeviceMemory memory = VK_NULL_HANDLE;
 		VkImageView view = VK_NULL_HANDLE;
 		VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+		// Per-level layouts (the warp target carries a mip chain whose
+		// levels diverge during blits). Mirrors layout for 1-level imgs.
+		std::vector<VkImageLayout> levels;
 	} srcColor, srcDepth, splat, dst;
 
-	// Pyramid fill scratch (RGBA32F sum+count): coarse0 is 1/8 res,
-	// coarse1 is 1/64 res, coarse2 is whole-frame (1 texel per
-	// 512x512). GENERAL throughout; single views serve both sampled
-	// and storage descriptors.
-	Image coarse0, coarse1, coarse2;
-	// Sampled view of dst (for the coarse build); storage views stay on
-	// .view. Created alongside, same image.
-	VkImageView dstSampledView = VK_NULL_HANDLE;
+	// Sampled view of dst mip levels 1..N for the fill pass.
+	VkImageView dstMipView = VK_NULL_HANDLE;
+	uint32_t mipLevels = 1;
 
 	struct Buffer {
 		VkBuffer handle = VK_NULL_HANDLE;
@@ -150,26 +149,17 @@ struct VulkanWarp::State {
 	VkSampler depthSampler = VK_NULL_HANDLE;
 	VkDescriptorSetLayout splatLayout = VK_NULL_HANDLE;
 	VkDescriptorSetLayout pullLayout = VK_NULL_HANDLE;
+	VkDescriptorSetLayout fillLayout = VK_NULL_HANDLE;
 	VkDescriptorPool descPool = VK_NULL_HANDLE;
 	VkDescriptorSet splatSet = VK_NULL_HANDLE;
 	VkDescriptorSet pullSet = VK_NULL_HANDLE;
+	VkDescriptorSet fillSet = VK_NULL_HANDLE;
 	VkPipelineLayout splatPipeLayout = VK_NULL_HANDLE;
 	VkPipelineLayout pullPipeLayout = VK_NULL_HANDLE;
+	VkPipelineLayout fillPipeLayout = VK_NULL_HANDLE;
 	VkPipeline splatPipe = VK_NULL_HANDLE;
 	VkPipeline pullPipe = VK_NULL_HANDLE;
-	VkDescriptorSetLayout coarse0Layout = VK_NULL_HANDLE;
-	VkDescriptorSetLayout coarse1Layout = VK_NULL_HANDLE;
-	VkDescriptorSetLayout fillLayout = VK_NULL_HANDLE;
-	VkPipelineLayout coarse0PipeLayout = VK_NULL_HANDLE;
-	VkPipelineLayout coarse1PipeLayout = VK_NULL_HANDLE;
-	VkPipelineLayout fillPipeLayout = VK_NULL_HANDLE;
-	VkPipeline coarse0Pipe = VK_NULL_HANDLE;
-	VkPipeline coarse1Pipe = VK_NULL_HANDLE;
 	VkPipeline fillPipe = VK_NULL_HANDLE;
-	VkDescriptorSet coarse0Set = VK_NULL_HANDLE;
-	VkDescriptorSet coarse1Set = VK_NULL_HANDLE;
-	VkDescriptorSet coarse2Set = VK_NULL_HANDLE;
-	VkDescriptorSet fillSet = VK_NULL_HANDLE;
 
 	// Optional GPU timestamp queries (stage timing). Created when the
 	// queue family supports them; all use is guarded by hasTimestamps.
@@ -256,14 +246,14 @@ bool CreateBuffer(VulkanWarp::State* s, VkDeviceSize size, VkBufferUsageFlags us
 }
 
 bool CreateImage(VulkanWarp::State* s, uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage,
-                 VulkanWarp::State::Image& img, std::string* error)
+                 VulkanWarp::State::Image& img, std::string* error, uint32_t mipLevels = 1)
 {
 	VkImageCreateInfo ci{};
 	ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
 	ci.imageType = VK_IMAGE_TYPE_2D;
 	ci.format = format;
 	ci.extent = {w, h, 1};
-	ci.mipLevels = 1;
+	ci.mipLevels = mipLevels;
 	ci.arrayLayers = 1;
 	ci.samples = VK_SAMPLE_COUNT_1_BIT;
 	ci.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -299,26 +289,40 @@ bool CreateImage(VulkanWarp::State* s, uint32_t w, uint32_t h, VkFormat format, 
 	if (!Check(vkCreateImageView(s->device, &vi, nullptr, &img.view), "vkCreateImageView", error))
 		return false;
 	img.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+	img.levels.assign(mipLevels, VK_IMAGE_LAYOUT_UNDEFINED);
 	return true;
 }
 
+// Whole-image Transition: kept for 1-level images. Mipped images use
+// TransitionLevels below.
 void Transition(VulkanWarp::State* s, VulkanWarp::State::Image& img, VkImageLayout next,
-                VkAccessFlags dstAccess, VkPipelineStageFlags dstStage)
+                VkAccessFlags dstAccess, VkPipelineStageFlags dstStage, uint32_t baseLevel = 0,
+                uint32_t levelCount = 1)
 {
-	if (img.layout == next)
-		return; // No same-layout transitions are recorded by callers.
+	// All tracked levels in range must already agree (true by
+	// construction: ranges are only ever transitioned uniformly).
+	// Skip when the whole range is already there.
+	bool already = true;
+	for (uint32_t i = baseLevel; i < baseLevel + levelCount && i < img.levels.size(); i++) {
+		if (img.levels[i] != next) {
+			already = false;
+			break;
+		}
+	}
+	if (already)
+		return;
 	VkImageMemoryBarrier bar{};
 	bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-	bar.oldLayout = img.layout;
+	bar.oldLayout = img.levels[baseLevel];
 	bar.newLayout = next;
 	bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	bar.image = img.handle;
-	bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, baseLevel, levelCount, 0, 1};
 	bar.dstAccessMask = dstAccess;
 	// Source masks derived from the tracked current layout.
 	VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-	switch (img.layout) {
+	switch (img.levels[baseLevel]) {
 	case VK_IMAGE_LAYOUT_UNDEFINED:
 		bar.srcAccessMask = 0;
 		srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
@@ -341,6 +345,8 @@ void Transition(VulkanWarp::State* s, VulkanWarp::State::Image& img, VkImageLayo
 		break;
 	}
 	vkCmdPipelineBarrier(s->cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &bar);
+	for (uint32_t i = baseLevel; i < baseLevel + levelCount && i < img.levels.size(); i++)
+		img.levels[i] = next;
 	img.layout = next;
 }
 
@@ -538,23 +544,16 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 		VkFormatProperties fp{};
 		vkGetPhysicalDeviceFormatProperties(s->phys, VK_FORMAT_R8G8B8A8_UNORM, &fp);
 		if (!(fp.optimalTilingFeatures &
-		      (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)))
-			return Fail(error, "R8G8B8A8_UNORM lacks sampled+storage support");
+		      (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
+		       VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
+		       VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)))
+			return Fail(error, "R8G8B8A8_UNORM lacks sampled+storage+blit+linear-filter support");
 		vkGetPhysicalDeviceFormatProperties(s->phys, VK_FORMAT_R32_SFLOAT, &fp);
 		if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))
 			return Fail(error, "R32_SFLOAT lacks sampled support");
 		vkGetPhysicalDeviceFormatProperties(s->phys, VK_FORMAT_R32_UINT, &fp);
 		if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))
 			return Fail(error, "R32_UINT lacks storage support");
-		vkGetPhysicalDeviceFormatProperties(s->phys, VK_FORMAT_R16G16B16A16_SFLOAT, &fp);
-		// NOTE: linear filtering is required (the fill pass bilinear-taps
-		// the pyramid). FILTER_LINEAR on 32-bit float is optional hardware
-		// support and must NOT be assumed; 16-bit float filtering is
-		// near-universal, which is why the pyramid is RGBA16F.
-		if (!(fp.optimalTilingFeatures &
-		      (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
-		       VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)))
-			return Fail(error, "R16G16B16A16_SFLOAT lacks sampled+storage+linear-filter support");
 	}
 
 	float prio = 1.0f;
@@ -603,42 +602,31 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 	                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
 	                 s->splat, error))
 		return false;
+	// Warp target: full mip chain (pull writes level 0, blits build the
+	// rest for the fill pass, level 0 is downloaded). Needs STORAGE
+	// (pull/fill) + SAMPLED (present copy? no — sampled mip view below)
+	// + TRANSFER (uploads? no — blits + download).
+	s->mipLevels = 1;
+	for (uint32_t m = (uint32_t)std::max(width, height); m > 1; m >>= 1)
+		s->mipLevels++;
 	if (!CreateImage(s, width, height, VK_FORMAT_R8G8B8A8_UNORM,
 	                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-	                         VK_IMAGE_USAGE_SAMPLED_BIT,
-	                 s->dst, error))
+	                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+	                 s->dst, error, s->mipLevels))
 		return false;
-	// Sampled view of dst for the coarse pyramid build (the storage
-	// view stays on .view). Same image, GENERAL layout throughout.
+	// Sampled view of levels 1..N for the fill pass (level 0 is written
+	// while these are read, so it must not be in the sampled view).
 	{
 		VkImageViewCreateInfo vi{};
 		vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
 		vi.image = s->dst.handle;
 		vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
 		vi.format = VK_FORMAT_R8G8B8A8_UNORM;
-		vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-		if (!Check(vkCreateImageView(s->device, &vi, nullptr, &s->dstSampledView),
-		           "dst sampled view", error))
+		vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 1, s->mipLevels - 1, 0, 1};
+		if (!Check(vkCreateImageView(s->device, &vi, nullptr, &s->dstMipView), "dst mip view",
+		           error))
 			return false;
 	}
-	// Pyramid fill scratch: 1/8, 1/64 and whole-frame sum+count planes
-	// (RGBA16F, half float: 32-bit float linear filtering is optional
-	// hardware support, 16-bit is near-universal).
-	uint32_t cw0 = (width + 7) / 8;
-	uint32_t ch0 = (height + 7) / 8;
-	uint32_t cw1 = (width + 63) / 64;
-	uint32_t ch1 = (height + 63) / 64;
-	uint32_t cw2 = (width + 511) / 512;
-	uint32_t ch2 = (height + 511) / 512;
-	if (!CreateImage(s, cw0, ch0, VK_FORMAT_R16G16B16A16_SFLOAT,
-	                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, s->coarse0, error))
-		return false;
-	if (!CreateImage(s, cw1, ch1, VK_FORMAT_R16G16B16A16_SFLOAT,
-	                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, s->coarse1, error))
-		return false;
-	if (!CreateImage(s, cw2, ch2, VK_FORMAT_R16G16B16A16_SFLOAT,
-	                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, s->coarse2, error))
-		return false;
 
 	// Buffers: UBOs + one staging buffer. Staging holds TWO planes
 	// (color at +0, depth at +planeBytes): both upload copies are
@@ -665,6 +653,10 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 	sci.magFilter = VK_FILTER_LINEAR;
 	sci.minFilter = VK_FILTER_LINEAR;
 	sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+	// maxLod must be uncapped: the fill pass samples explicit mip LODs
+	// via textureLod (the default 0.0 would clamp every tap to level 0).
+	sci.minLod = 0.0f;
+	sci.maxLod = VK_LOD_CLAMP_NONE;
 	// Color sampler: linear, edge-clamped. Out-of-bounds taps are
 	// already rejected in-shader (inBounds), so border-black would only
 	// darken the valid 1-px rim where linear filtering touches the edge.
@@ -722,40 +714,10 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 	           error))
 		return false;
 
-	// Coarse pyramid + fill layouts.
-	// coarse0: dst sampled + splat storage + L0 storage.
-	VkDescriptorSetLayoutBinding coarse0Bindings[3]{};
+	// Fill layout: dst storage (read-write) + splat storage + dst
+	// mip-chain sampled (single view covering levels 1..N).
+	VkDescriptorSetLayoutBinding fillBindings[3]{};
 	for (uint32_t i = 0; i < 3; i++) {
-		coarse0Bindings[i].binding = i;
-		coarse0Bindings[i].descriptorCount = 1;
-		coarse0Bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	}
-	coarse0Bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	coarse0Bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-	coarse0Bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-	li.bindingCount = 3;
-	li.pBindings = coarse0Bindings;
-	if (!Check(vkCreateDescriptorSetLayout(s->device, &li, nullptr, &s->coarse0Layout),
-	           "coarse0 layout", error))
-		return false;
-	// coarse1: L0 sampled + L1 storage.
-	VkDescriptorSetLayoutBinding coarse1Bindings[2]{};
-	for (uint32_t i = 0; i < 2; i++) {
-		coarse1Bindings[i].binding = i;
-		coarse1Bindings[i].descriptorCount = 1;
-		coarse1Bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	}
-	coarse1Bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	coarse1Bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-	li.bindingCount = 2;
-	li.pBindings = coarse1Bindings;
-	if (!Check(vkCreateDescriptorSetLayout(s->device, &li, nullptr, &s->coarse1Layout),
-	           "coarse1 layout", error))
-		return false;
-	// Fill needs the two-level pyramid plus the whole-frame average:
-	// dst storage(rw) + splat storage + L0/L1/L2 sampled.
-	VkDescriptorSetLayoutBinding fillBindings[5]{};
-	for (uint32_t i = 0; i < 5; i++) {
 		fillBindings[i].binding = i;
 		fillBindings[i].descriptorCount = 1;
 		fillBindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -763,9 +725,7 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 	fillBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 	fillBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 	fillBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	fillBindings[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	fillBindings[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	li.bindingCount = 5;
+	li.bindingCount = 3;
 	li.pBindings = fillBindings;
 	if (!Check(vkCreateDescriptorSetLayout(s->device, &li, nullptr, &s->fillLayout), "fill layout",
 	           error))
@@ -773,14 +733,14 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 
 	VkDescriptorPoolSize poolSizes[3]{};
 	poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	poolSizes[0].descriptorCount = 8; // splat,pull,coarse0,coarse1,coarse2,fill x3
+	poolSizes[0].descriptorCount = 3; // splat, pull, fill
 	poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 	poolSizes[1].descriptorCount = 2;
 	poolSizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-	poolSizes[2].descriptorCount = 9; // splat,pull x2,coarse0 x2,coarse1,coarse2,fill x2
+	poolSizes[2].descriptorCount = 5; // splat, pull x2, fill x2
 	VkDescriptorPoolCreateInfo dpi{};
 	dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-	dpi.maxSets = 6;
+	dpi.maxSets = 3;
 	dpi.poolSizeCount = 3;
 	dpi.pPoolSizes = poolSizes;
 	if (!Check(vkCreateDescriptorPool(s->device, &dpi, nullptr, &s->descPool), "desc pool", error))
@@ -794,19 +754,6 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 		return false;
 	alloc.pSetLayouts = &s->pullLayout;
 	if (!Check(vkAllocateDescriptorSets(s->device, &alloc, &s->pullSet), "alloc pull set", error))
-		return false;
-	alloc.pSetLayouts = &s->coarse0Layout;
-	if (!Check(vkAllocateDescriptorSets(s->device, &alloc, &s->coarse0Set), "alloc coarse0 set",
-	                                   error))
-		return false;
-	alloc.pSetLayouts = &s->coarse1Layout;
-	if (!Check(vkAllocateDescriptorSets(s->device, &alloc, &s->coarse1Set), "alloc coarse1 set",
-	                                   error))
-		return false;
-	// Coarse2 reuses the coarse1 layout (sampled in + storage out).
-	alloc.pSetLayouts = &s->coarse1Layout;
-	if (!Check(vkAllocateDescriptorSets(s->device, &alloc, &s->coarse2Set), "alloc coarse2 set",
-	           error))
 		return false;
 	alloc.pSetLayouts = &s->fillLayout;
 	if (!Check(vkAllocateDescriptorSets(s->device, &alloc, &s->fillSet), "alloc fill set", error))
@@ -861,35 +808,23 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 	writeUniform(s->pullSet, 1, s->uboPull);
 	writeStorage(s->pullSet, 2, s->splat.view);
 	writeStorage(s->pullSet, 3, s->dst.view);
-	// Pyramid sets. dst/L0/L1 sampled views stay GENERAL (no layout
-	// churn between pull, coarse and fill on the same queue).
-	writeCombined(s->coarse0Set, 0, s->colorSampler, s->dstSampledView, VK_IMAGE_LAYOUT_GENERAL);
-	writeStorage(s->coarse0Set, 1, s->splat.view);
-	writeStorage(s->coarse0Set, 2, s->coarse0.view);
-	writeCombined(s->coarse1Set, 0, s->colorSampler, s->coarse0.view, VK_IMAGE_LAYOUT_GENERAL);
-	writeStorage(s->coarse1Set, 1, s->coarse1.view);
-	writeCombined(s->coarse2Set, 0, s->colorSampler, s->coarse1.view, VK_IMAGE_LAYOUT_GENERAL);
-	writeStorage(s->coarse2Set, 1, s->coarse2.view);
 	writeStorage(s->fillSet, 0, s->dst.view);
 	writeStorage(s->fillSet, 1, s->splat.view);
-	writeCombined(s->fillSet, 2, s->colorSampler, s->coarse0.view, VK_IMAGE_LAYOUT_GENERAL);
-	writeCombined(s->fillSet, 3, s->colorSampler, s->coarse1.view, VK_IMAGE_LAYOUT_GENERAL);
-	writeCombined(s->fillSet, 4, s->colorSampler, s->coarse2.view, VK_IMAGE_LAYOUT_GENERAL);
+	writeCombined(s->fillSet, 2, s->colorSampler, s->dstMipView,
+	              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
 	// Pipelines.
-	std::vector<uint32_t> splatSpv, pullSpv, coarse0Spv, coarse1Spv, fillSpv;
+	std::vector<uint32_t> splatSpv, pullSpv, fillSpv;
 	if (!LoadSpv(spvDir + "/warp_splat.spv", splatSpv, error) ||
 	    !LoadSpv(spvDir + "/warp_pull.spv", pullSpv, error) ||
-	    !LoadSpv(spvDir + "/warp_coarse0.spv", coarse0Spv, error) ||
-	    !LoadSpv(spvDir + "/warp_coarse1.spv", coarse1Spv, error) ||
 	    !LoadSpv(spvDir + "/warp_fill.spv", fillSpv, error))
 		return false;
 	std::cout << "[vulkan] SPIR-V: warp_splat.spv " << splatSpv.size() * 4 << " bytes, warp_pull.spv "
-	          << pullSpv.size() * 4 << " bytes, warp_coarse0.spv " << coarse0Spv.size() * 4
-	          << " bytes, warp_coarse1.spv " << coarse1Spv.size() * 4 << " bytes, warp_fill.spv "
-	          << fillSpv.size() * 4 << " bytes" << std::endl;
+	          << pullSpv.size() * 4 << " bytes, warp_fill.spv " << fillSpv.size() * 4 << " bytes"
+	          << std::endl;
 	auto makePipe = [&](const std::vector<uint32_t>& spv, VkDescriptorSetLayout layout,
-	                    VkPipelineLayout& pipeLayout, VkPipeline& pipe, const char* what) {
+	                    VkPipelineLayout& pipeLayout, VkPipeline& pipe, const char* what,
+	                    uint32_t pushSize = 0) {
 		VkShaderModuleCreateInfo mi{};
 		mi.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
 		mi.codeSize = spv.size() * sizeof(uint32_t);
@@ -901,6 +836,9 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 		pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
 		pli.setLayoutCount = 1;
 		pli.pSetLayouts = &layout;
+		VkPushConstantRange pushRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, pushSize };
+		pli.pushConstantRangeCount = pushSize ? 1u : 0u;
+		pli.pPushConstantRanges = pushSize ? &pushRange : nullptr;
 		bool ok = Check(vkCreatePipelineLayout(s->device, &pli, nullptr, &pipeLayout), what, error);
 		if (ok) {
 			VkComputePipelineCreateInfo pci{};
@@ -920,18 +858,13 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 		return false;
 	if (!makePipe(pullSpv, s->pullLayout, s->pullPipeLayout, s->pullPipe, "pull pipeline"))
 		return false;
-	if (!makePipe(coarse0Spv, s->coarse0Layout, s->coarse0PipeLayout, s->coarse0Pipe,
-	              "coarse0 pipeline"))
-		return false;
-	if (!makePipe(coarse1Spv, s->coarse1Layout, s->coarse1PipeLayout, s->coarse1Pipe,
-	              "coarse1 pipeline"))
-		return false;
-	if (!makePipe(fillSpv, s->fillLayout, s->fillPipeLayout, s->fillPipe, "fill pipeline"))
+	if (!makePipe(fillSpv, s->fillLayout, s->fillPipeLayout, s->fillPipe, "fill pipeline",
+	              sizeof(int32_t)))
 		return false;
 
 	// Timestamp queries: 0 submit-start, 1 after clear, 2 after splat,
-	// 3 after pull, 4 after coarse0, 5 after coarse1, 6 after coarse2,
-	// 7 after fill, 8 after dst copy. Optional; guarded everywhere.
+	// 3 after pull, 4 after blits, 5 after fill, 6 after dst copy.
+	// Optional; guarded everywhere.
 	{
 		uint32_t qCount = 0;
 		vkGetPhysicalDeviceQueueFamilyProperties(s->phys, &qCount, nullptr);
@@ -945,7 +878,7 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 			VkQueryPoolCreateInfo qi{};
 			qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
 			qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
-			qi.queryCount = 9;
+			qi.queryCount = 7;
 			if (Check(vkCreateQueryPool(s->device, &qi, nullptr, &s->queryPool),
 			          "timestamp query pool", nullptr)) {
 				s->hasTimestamps = true;
@@ -977,20 +910,12 @@ void VulkanWarp::Shutdown()
 			vkDestroyPipeline(s->device, s->splatPipe, nullptr);
 		if (s->pullPipe)
 			vkDestroyPipeline(s->device, s->pullPipe, nullptr);
-		if (s->coarse0Pipe)
-			vkDestroyPipeline(s->device, s->coarse0Pipe, nullptr);
-		if (s->coarse1Pipe)
-			vkDestroyPipeline(s->device, s->coarse1Pipe, nullptr);
 		if (s->fillPipe)
 			vkDestroyPipeline(s->device, s->fillPipe, nullptr);
 		if (s->splatPipeLayout)
 			vkDestroyPipelineLayout(s->device, s->splatPipeLayout, nullptr);
 		if (s->pullPipeLayout)
 			vkDestroyPipelineLayout(s->device, s->pullPipeLayout, nullptr);
-		if (s->coarse0PipeLayout)
-			vkDestroyPipelineLayout(s->device, s->coarse0PipeLayout, nullptr);
-		if (s->coarse1PipeLayout)
-			vkDestroyPipelineLayout(s->device, s->coarse1PipeLayout, nullptr);
 		if (s->fillPipeLayout)
 			vkDestroyPipelineLayout(s->device, s->fillPipeLayout, nullptr);
 		if (s->descPool)
@@ -999,10 +924,6 @@ void VulkanWarp::Shutdown()
 			vkDestroyDescriptorSetLayout(s->device, s->splatLayout, nullptr);
 		if (s->pullLayout)
 			vkDestroyDescriptorSetLayout(s->device, s->pullLayout, nullptr);
-		if (s->coarse0Layout)
-			vkDestroyDescriptorSetLayout(s->device, s->coarse0Layout, nullptr);
-		if (s->coarse1Layout)
-			vkDestroyDescriptorSetLayout(s->device, s->coarse1Layout, nullptr);
 		if (s->fillLayout)
 			vkDestroyDescriptorSetLayout(s->device, s->fillLayout, nullptr);
 		if (s->colorSampler)
@@ -1032,11 +953,8 @@ void VulkanWarp::Shutdown()
 		freeImg(s->srcDepth);
 		freeImg(s->splat);
 		freeImg(s->dst);
-		freeImg(s->coarse0);
-		freeImg(s->coarse1);
-		freeImg(s->coarse2);
-		if (s->dstSampledView)
-			vkDestroyImageView(s->device, s->dstSampledView, nullptr);
+		if (s->dstMipView)
+			vkDestroyImageView(s->device, s->dstMipView, nullptr);
 		if (s->fence)
 			vkDestroyFence(s->device, s->fence, nullptr);
 		if (s->pool)
@@ -1120,7 +1038,7 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 	if (!BeginOnce(s, &lastError_))
 		return false;
 	if (s->hasTimestamps) {
-		vkCmdResetQueryPool(s->cmd, s->queryPool, 0, 8);
+		vkCmdResetQueryPool(s->cmd, s->queryPool, 0, 7);
 		vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s->queryPool, 0);
 	}
 
@@ -1170,78 +1088,53 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 		vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 3);
 
 	if (doFill) {
-		// Pyramid hole fill: coarse L0/L1/L2 from the pulled colors,
-		// then patch black pixels with the local average. All pyramid
-		// images stay GENERAL. Global compute barriers order the chain:
-		// pull-write -> coarse reads -> fill writes (a WAW/RAR hazard on
-		// dst across pull/coarse/fill needs full visibility, and the
-		// timestamp writes alone are execution-only).
-		auto computeBarrier = [&]() {
-			VkMemoryBarrier bar{};
-			bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-			bar.srcAccessMask =
-			    VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
-			bar.dstAccessMask =
-			    VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
-			vkCmdPipelineBarrier(s->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-			                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &bar, 0, nullptr, 0,
-			                     nullptr);
-		};
-		Transition(s, s->coarse0, VK_IMAGE_LAYOUT_GENERAL,
-		           VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
-		           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-		Transition(s, s->coarse1, VK_IMAGE_LAYOUT_GENERAL,
-		           VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
-		           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-		Transition(s, s->coarse2, VK_IMAGE_LAYOUT_GENERAL,
-		           VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
-		           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-		computeBarrier(); // pull writes visible to the coarse build
-
-		vkCmdBindPipeline(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s->coarse0Pipe);
-		vkCmdBindDescriptorSets(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s->coarse0PipeLayout, 0,
-		                        1, &s->coarse0Set, 0, nullptr);
-		uint32_t c0x = ((width_ + 7) / 8 + 7) / 8;
-		uint32_t c0y = ((height_ + 7) / 8 + 7) / 8;
-		vkCmdDispatch(s->cmd, c0x, c0y, 1);
+		// Mip-chain hole fill: blit the premultiplied pull output down
+		// the chain, then patch black pixels with the local average.
+		// A blit chain is fixed-function (no shader ALU), and sampling
+		// the chain with divide-by-alpha yields the validity-weighted
+		// mean: blurred fill, never stretched. Constant cost per hole.
+		uint32_t mw = width_, mh = height_;
+		Transition(s, s->dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		           VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1);
+		for (uint32_t i = 1; i < s->mipLevels; i++) {
+			Transition(s, s->dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			           VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, i, 1);
+			VkImageBlit blit{};
+			blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 0, 1};
+			blit.srcOffsets[1] = {static_cast<int32_t>(mw), static_cast<int32_t>(mh), 1};
+			mw = std::max(1u, mw / 2);
+			mh = std::max(1u, mh / 2);
+			blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1};
+			blit.dstOffsets[1] = {static_cast<int32_t>(mw), static_cast<int32_t>(mh), 1};
+			vkCmdBlitImage(s->cmd, s->dst.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			               s->dst.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+			               VK_FILTER_LINEAR);
+			Transition(s, s->dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			           VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, i, 1);
+		}
 		if (s->hasTimestamps)
 			vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 4);
-		computeBarrier();
-
-		vkCmdBindPipeline(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s->coarse1Pipe);
-		vkCmdBindDescriptorSets(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s->coarse1PipeLayout, 0,
-		                        1, &s->coarse1Set, 0, nullptr);
-		uint32_t c1x = ((width_ + 63) / 64 + 7) / 8;
-		uint32_t c1y = ((height_ + 63) / 64 + 7) / 8;
-		vkCmdDispatch(s->cmd, c1x, c1y, 1);
-		if (s->hasTimestamps)
-			vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 5);
-		computeBarrier();
-
-		vkCmdBindPipeline(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s->coarse1Pipe);
-		vkCmdBindDescriptorSets(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s->coarse1PipeLayout, 0,
-		                        1, &s->coarse2Set, 0, nullptr);
-		uint32_t c2x = ((width_ + 511) / 512 + 7) / 8;
-		uint32_t c2y = ((height_ + 511) / 512 + 7) / 8;
-		vkCmdDispatch(s->cmd, c2x, c2y, 1);
-		if (s->hasTimestamps)
-			vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 6);
-		computeBarrier();
-
+		// Mip levels 1..N become shader-readable for the fill tap.
+		Transition(s, s->dst, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		           VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 1,
+		           s->mipLevels - 1);
+		// Level 0 back to GENERAL for fill writes.
+		Transition(s, s->dst, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
+		           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1);
 		vkCmdBindPipeline(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s->fillPipe);
 		vkCmdBindDescriptorSets(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s->fillPipeLayout, 0, 1,
 		                        &s->fillSet, 0, nullptr);
+		// View-relative LOD cap: view covers levels 1..N, so max lod is N-2.
+		int32_t maxViewLod = static_cast<int32_t>(s->mipLevels) - 2;
+		vkCmdPushConstants(s->cmd, s->fillPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+		                   sizeof(maxViewLod), &maxViewLod);
 		vkCmdDispatch(s->cmd, gx, gy, 1);
 		if (s->hasTimestamps)
-			vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 7);
-		computeBarrier();
+			vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 5);
 	} else if (s->hasTimestamps) {
 		// Keep query indices stable when fill is off.
 		vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 4);
 		vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 5);
-		vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 6);
-		vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 7);
-		vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 8);
 	}
 
 	// Read back dst (and the splat plane for coverage, same submit).
@@ -1266,7 +1159,7 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 		                       s->staging.handle, 1, &copySplat);
 	}
 	if (s->hasTimestamps)
-		vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 8);
+	vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 6);
 	if (!SubmitWait(s, &lastError_)) {
 		if (lastError_.empty())
 			lastError_ = "Warp: submit/wait failed";
@@ -1278,16 +1171,16 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 	// GPU stage times (fence already waited, so results are ready).
 	lastGpu_ = GpuTimes{};
 	if (s->hasTimestamps) {
-		uint64_t ts[9] = {};
-		if (vkGetQueryPoolResults(s->device, s->queryPool, 0, 9, sizeof(ts), ts, sizeof(uint64_t),
+		uint64_t ts[7] = {};
+		if (vkGetQueryPoolResults(s->device, s->queryPool, 0, 7, sizeof(ts), ts, sizeof(uint64_t),
 		                          VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) ==
 		    VK_SUCCESS) {
 			lastGpu_.valid = true;
 			lastGpu_.clearMs = (ts[1] - ts[0]) * s->timestampPeriodMs;
 			lastGpu_.splatMs = (ts[2] - ts[1]) * s->timestampPeriodMs;
 			lastGpu_.pullMs = (ts[3] - ts[2]) * s->timestampPeriodMs;
-			lastGpu_.fillMs = doFill ? (ts[7] - ts[3]) * s->timestampPeriodMs : 0.0;
-			lastGpu_.copyMs = (ts[8] - (doFill ? ts[7] : ts[3])) * s->timestampPeriodMs;
+			lastGpu_.fillMs = doFill ? (ts[5] - ts[3]) * s->timestampPeriodMs : 0.0;
+			lastGpu_.copyMs = (ts[6] - (doFill ? ts[5] : ts[3])) * s->timestampPeriodMs;
 		}
 	}
 

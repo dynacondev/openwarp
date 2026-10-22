@@ -5,10 +5,10 @@
  *
  * One thread per target pixel: read the splatted foreground depth,
  * unproject with the target inverses and reproject with the source
- * projection, then tap the retained color. Disoccluded pixels (no
- * valid splat) are filled by an expanding-ring search for the nearest
- * valid splat, up to the hole radius; anything still invalid keeps
- * black.
+ * projection, then tap the retained color. Output is PREMULTIPLIED:
+ * valid pixels store (rgb, 1), disoccluded pixels (0,0,0,0). The mip
+ * chain built afterwards therefore averages to a validity-weighted
+ * local mean, which the fill pass samples.
  *
  * Warp math follows the OpenWarp family
  * (https://github.com/Zee2/openwarp, NCSA-licensed).
@@ -80,5 +80,5 @@ void main()
 	}
 
 	vec4 color = texture(srcColor, suv);
-	imageStore(dstColor, dstXY, color);
+	imageStore(dstColor, dstXY, vec4(color.rgb, 1.0));
 }

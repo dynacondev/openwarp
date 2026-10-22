@@ -74,9 +74,11 @@ public:
 
 	// Warp the uploaded frame from (srcPose, srcProj) to
 	// (dstPose, dstProj) and download the RGB8 result into outColor
-	// (width*height*4 bytes). holeRadius > 0 enables the pyramid hole
-	// fill (validity-weighted local average, constant cost per hole
-	// pixel); 0 leaves disocclusions black.
+	// (width*height*4 bytes). holeRadius > 0 enables the mip-chain hole
+	// fill: the premultiplied pull output is blitted down the mip chain
+	// (fixed-function) and hole pixels sample the local average, i.e.
+	// the validity-weighted mean (blurred, never stretched). Constant
+	// cost per hole pixel; 0 leaves disocclusions black.
 	// srcProj/dstProj are PerspectiveGL/FrustumGL matrices; near/far
 	// must match between the two (same convention as dynacon-vr).
 	// countCoverage also downloads the splat plane and counts filled
