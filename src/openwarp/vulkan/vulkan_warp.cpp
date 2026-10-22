@@ -8,6 +8,7 @@
 #include <Eigen/Dense>
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -345,6 +346,7 @@ bool VulkanWarp::Fail(std::string* error, const std::string& msg)
 {
 	if (error)
 		*error = msg;
+	lastError_ = msg;
 	return false;
 }
 
@@ -358,14 +360,14 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 	state_ = new State();
 	State* s = state_;
 
-	// Instance (no extensions needed headless; try validation, ignore absence).
-	VkApplicationInfo app{};
-	app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-	app.pApplicationName = "openwarp-vulkan-warp";
-	app.apiVersion = VK_API_VERSION_1_0;
+	// Instance (no extensions needed headless). Validation is strictly
+	// opt-in: the layer instruments every call and would tax the live
+	// path. Set OPENWARP_VK_VALIDATION=1 to enable (no debug callback;
+	// check stderr for layer output).
+	bool wantValidation = std::getenv("OPENWARP_VK_VALIDATION") != nullptr;
 	const char* layer = "VK_LAYER_KHRONOS_validation";
 	uint32_t layerCount = 0;
-	{
+	if (wantValidation) {
 		uint32_t n = 0;
 		if (vkEnumerateInstanceLayerProperties(&n, nullptr) == VK_SUCCESS && n > 0) {
 			std::vector<VkLayerProperties> props(n);
@@ -378,16 +380,26 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 				}
 			}
 		}
+		if (!layerCount)
+			std::cout << "[vulkan] OPENWARP_VK_VALIDATION=1 but layer not present" << std::endl;
 	}
 	VkInstanceCreateInfo ii{};
 	ii.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+	VkApplicationInfo app{};
+	app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+	app.pApplicationName = "openwarp-vulkan-warp";
+	app.apiVersion = VK_API_VERSION_1_0;
 	ii.pApplicationInfo = &app;
 	ii.enabledLayerCount = layerCount;
 	ii.ppEnabledLayerNames = layerCount ? &layer : nullptr;
 	if (!Check(vkCreateInstance(&ii, nullptr, &s->instance), "vkCreateInstance", error))
 		return false;
+	std::cout << "[vulkan] validation " << (layerCount ? "ON" : "off") << std::endl;
 
-	// Physical device with a compute-capable queue.
+	// Physical device: prefer discrete GPU (the GL demo usually runs
+	// there; picking the first enumerated device lands on the iGPU on
+	// Optimus laptops and forces every frame over PCIe twice).
+	// OPENWARP_VK_DEVICE=<index> overrides.
 	uint32_t devCount = 0;
 	if (!Check(vkEnumeratePhysicalDevices(s->instance, &devCount, nullptr),
 	           "vkEnumeratePhysicalDevices", error) ||
@@ -395,25 +407,81 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 		return Fail(error, "no Vulkan physical devices");
 	std::vector<VkPhysicalDevice> devs(devCount);
 	vkEnumeratePhysicalDevices(s->instance, &devCount, devs.data());
-	bool picked = false;
-	for (auto d : devs) {
+	auto devScore = [](VkPhysicalDeviceType t) {
+		switch (t) {
+		case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: return 4;
+		case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: return 3;
+		case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: return 2;
+		case VK_PHYSICAL_DEVICE_TYPE_CPU: return 1;
+		default: return 0;
+		}
+	};
+	int forcedIdx = -1;
+	if (const char* env = std::getenv("OPENWARP_VK_DEVICE"))
+		forcedIdx = std::atoi(env);
+	int best = -1;
+	int bestScore = -1;
+	uint32_t bestFamily = 0;
+	for (uint32_t di = 0; di < devCount; di++) {
+		VkPhysicalDeviceProperties props{};
+		vkGetPhysicalDeviceProperties(devs[di], &props);
 		uint32_t qCount = 0;
-		vkGetPhysicalDeviceQueueFamilyProperties(d, &qCount, nullptr);
+		vkGetPhysicalDeviceQueueFamilyProperties(devs[di], &qCount, nullptr);
 		std::vector<VkQueueFamilyProperties> qs(qCount);
-		vkGetPhysicalDeviceQueueFamilyProperties(d, &qCount, qs.data());
+		vkGetPhysicalDeviceQueueFamilyProperties(devs[di], &qCount, qs.data());
+		int fam = -1;
 		for (uint32_t i = 0; i < qCount; i++) {
 			if (qs[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
-				s->phys = d;
-				s->queueFamily = i;
-				picked = true;
+				fam = static_cast<int>(i);
 				break;
 			}
 		}
-		if (picked)
-			break;
+		const char* tn = "other";
+		switch (props.deviceType) {
+		case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: tn = "discrete"; break;
+		case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: tn = "integrated"; break;
+		case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: tn = "virtual"; break;
+		case VK_PHYSICAL_DEVICE_TYPE_CPU: tn = "cpu"; break;
+		default: break;
+		}
+		std::cout << "[vulkan] device " << di << ": " << props.deviceName << " (" << tn
+		          << ", driver 0x" << std::hex << props.driverVersion << std::dec
+		          << (fam >= 0 ? ", compute ok" : ", NO compute queue") << ")" << std::endl;
+		if (fam < 0)
+			continue;
+		int score = (forcedIdx == static_cast<int>(di)) ? 100 : devScore(props.deviceType);
+		if (score > bestScore) {
+			bestScore = score;
+			best = static_cast<int>(di);
+			bestFamily = static_cast<uint32_t>(fam);
+		}
 	}
-	if (!picked)
+	if (best < 0)
 		return Fail(error, "no compute-capable Vulkan queue family");
+	s->phys = devs[static_cast<uint32_t>(best)];
+	s->queueFamily = bestFamily;
+	{
+		VkPhysicalDeviceProperties props{};
+		vkGetPhysicalDeviceProperties(s->phys, &props);
+		deviceName_ = props.deviceName;
+		std::cout << "[vulkan] using device " << best << ": " << props.deviceName
+		          << " (queue family " << s->queueFamily << ")" << std::endl;
+	}
+
+	// Format sanity: the warp needs these feature bits on OPTIMAL images.
+	{
+		VkFormatProperties fp{};
+		vkGetPhysicalDeviceFormatProperties(s->phys, VK_FORMAT_R8G8B8A8_UNORM, &fp);
+		if (!(fp.optimalTilingFeatures &
+		      (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)))
+			return Fail(error, "R8G8B8A8_UNORM lacks sampled+storage support");
+		vkGetPhysicalDeviceFormatProperties(s->phys, VK_FORMAT_R32_SFLOAT, &fp);
+		if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))
+			return Fail(error, "R32_SFLOAT lacks sampled support");
+		vkGetPhysicalDeviceFormatProperties(s->phys, VK_FORMAT_R32_UINT, &fp);
+		if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))
+			return Fail(error, "R32_UINT lacks storage support");
+	}
 
 	float prio = 1.0f;
 	VkDeviceQueueCreateInfo qi{};
@@ -623,6 +691,8 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 	if (!LoadSpv(spvDir + "/warp_splat.spv", splatSpv, error) ||
 	    !LoadSpv(spvDir + "/warp_pull.spv", pullSpv, error))
 		return false;
+	std::cout << "[vulkan] SPIR-V: warp_splat.spv " << splatSpv.size() * 4 << " bytes, warp_pull.spv "
+	          << pullSpv.size() * 4 << " bytes" << std::endl;
 	auto makePipe = [&](const std::vector<uint32_t>& spv, VkDescriptorSetLayout layout,
 	                    VkPipelineLayout& pipeLayout, VkPipeline& pipe, const char* what) {
 		VkShaderModuleCreateInfo mi{};
@@ -726,13 +796,12 @@ void VulkanWarp::Shutdown()
 bool VulkanWarp::Upload(const uint8_t* colorRGBA, const float* depth)
 {
 	if (!initialized_ || !colorRGBA || !depth)
-		return false;
+		return Fail(nullptr, "Upload: not initialized or null plane");
 	State* s = state_;
-	std::string error;
 	VkDeviceSize colorBytes = static_cast<VkDeviceSize>(width_) * height_ * 4;
 	VkDeviceSize depthBytes = static_cast<VkDeviceSize>(width_) * height_ * sizeof(float);
 	VkDeviceSize planeBytes = colorBytes; // staging: color @+0, depth @+planeBytes
-	if (!BeginOnce(s, nullptr))
+	if (!BeginOnce(s, &lastError_))
 		return false;
 	auto uploadPlane = [&](State::Image& img, const void* data, VkDeviceSize bytes,
 	                         VkDeviceSize stagingOffset) {
@@ -752,18 +821,20 @@ bool VulkanWarp::Upload(const uint8_t* colorRGBA, const float* depth)
 	};
 	uploadPlane(s->srcColor, colorRGBA, colorBytes, 0);
 	uploadPlane(s->srcDepth, depth, depthBytes, planeBytes);
-	(void)error;
-	if (!SubmitWait(s, nullptr))
+	if (!SubmitWait(s, &lastError_)) {
+		if (lastError_.empty())
+			lastError_ = "Upload: submit/wait failed";
 		return false;
+	}
 	s->srcUploaded = true;
 	return true;
 }
 
 bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPose, const Mat4 dstProj,
-                      float holeRadius, std::vector<uint8_t>& outColor)
+                      float holeRadius, std::vector<uint8_t>& outColor, bool countCoverage)
 {
 	if (!initialized_ || !state_->srcUploaded)
-		return false;
+		return Fail(nullptr, "Warp: not initialized or nothing uploaded");
 	State* s = state_;
 
 	// Fold matrices on the CPU (same order as dynacon-vr depth_reprojector).
@@ -773,11 +844,11 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 		CameraFromPose(srcPose, camSrc);
 		CameraFromPose(dstPose, camDst);
 		if (!Inverse(camSrc, viewSrc) || !Inverse(camDst, viewDst))
-			return false;
+			return Fail(nullptr, "Warp: singular camera matrix");
 	}
 	if (!Inverse(srcProj, renderInvP) || !Inverse(viewSrc, renderInvV) || !Inverse(dstProj, dstInvP) ||
 	    !Inverse(viewDst, dstInvV))
-		return false;
+		return Fail(nullptr, "Warp: singular projection/view matrix");
 	SplatUBO splatUbo{};
 	PullUBO pullUbo{};
 	Multiply(renderInvV, renderInvP, splatUbo.renderInvVP);
@@ -789,7 +860,7 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 	std::memcpy(s->uboSplat.mapped, &splatUbo, sizeof(splatUbo));
 	std::memcpy(s->uboPull.mapped, &pullUbo, sizeof(pullUbo));
 
-	if (!BeginOnce(s, nullptr))
+	if (!BeginOnce(s, &lastError_))
 		return false;
 
 	// Splat scratch: clear to "empty" every warp, then splat.
@@ -831,10 +902,8 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 	                        &s->pullSet, 0, nullptr);
 	vkCmdDispatch(s->cmd, gx, gy, 1);
 
-	// Read back dst + coverage in one submit.
+	// Read back dst (and the splat plane for coverage, same submit).
 	Transition(s, s->dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
-	           VK_PIPELINE_STAGE_TRANSFER_BIT);
-	Transition(s, s->splat, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
 	           VK_PIPELINE_STAGE_TRANSFER_BIT);
 	VkDeviceSize colorBytes = static_cast<VkDeviceSize>(width_) * height_ * 4;
 	VkBufferImageCopy copy{};
@@ -842,31 +911,39 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 	copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
 	vkCmdCopyImageToBuffer(s->cmd, s->dst.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 	                       s->staging.handle, 1, &copy);
-	if (!SubmitWait(s, nullptr))
+	if (countCoverage) {
+		// Splat copy lands at staging offset colorBytes (staging is
+		// 2 planes; Upload's contents were already consumed).
+		Transition(s, s->splat, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
+		           VK_PIPELINE_STAGE_TRANSFER_BIT);
+		VkBufferImageCopy copySplat{};
+		copySplat.bufferOffset = colorBytes;
+		copySplat.imageExtent = {width_, height_, 1};
+		copySplat.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+		vkCmdCopyImageToBuffer(s->cmd, s->splat.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		                       s->staging.handle, 1, &copySplat);
+	}
+	if (!SubmitWait(s, &lastError_)) {
+		if (lastError_.empty())
+			lastError_ = "Warp: submit/wait failed";
 		return false;
+	}
 	outColor.resize(static_cast<size_t>(colorBytes));
 	std::memcpy(outColor.data(), s->staging.mapped, static_cast<size_t>(colorBytes));
 
-	// Coverage: count non-empty splat texels (second submit reuses staging).
-	if (!BeginOnce(s, nullptr))
-		return false;
-	VkDeviceSize splatBytes = colorBytes;
-	VkBufferImageCopy copySplat{};
-	copySplat.imageExtent = {width_, height_, 1};
-	copySplat.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-	vkCmdCopyImageToBuffer(s->cmd, s->splat.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	                       s->staging.handle, 1, &copySplat);
-	if (!SubmitWait(s, nullptr))
-		return false;
-	size_t filled = 0;
-	size_t total = static_cast<size_t>(width_) * height_;
-	const uint32_t* words = static_cast<const uint32_t*>(s->staging.mapped);
-	for (size_t i = 0; i < total; i++) {
-		if (words[i] != kSplatEmpty)
-			filled++;
+	// Coverage: count non-empty splat texels from the same submit.
+	if (countCoverage) {
+		size_t filled = 0;
+		size_t total = static_cast<size_t>(width_) * height_;
+		const uint32_t* words =
+		    static_cast<const uint32_t*>(static_cast<const void*>(static_cast<const uint8_t*>(
+		        s->staging.mapped) + static_cast<size_t>(colorBytes)));
+		for (size_t i = 0; i < total; i++) {
+			if (words[i] != kSplatEmpty)
+				filled++;
+		}
+		lastCoverage_ = total ? static_cast<float>(filled) / static_cast<float>(total) : 0.0f;
 	}
-	lastCoverage_ = total ? static_cast<float>(filled) / static_cast<float>(total) : 0.0f;
-	(void)splatBytes;
 	(void)kDepthScale;
 	return true;
 }

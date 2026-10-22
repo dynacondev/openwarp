@@ -69,17 +69,28 @@ public:
 	bool Upload(const uint8_t* colorRGBA, const float* depth);
 
 	// Warp the uploaded frame from (srcPose, srcProj) to
-	// (dstPose, dstProj) and download the RGBA8 result into outColor
+	// (dstPose, dstProj) and download the RGB8 result into outColor
 	// (width*height*4 bytes). holeRadius 0 disables hole fill.
 	// srcProj/dstProj are PerspectiveGL/FrustumGL matrices; near/far
 	// must match between the two (same convention as dynacon-vr).
+	// countCoverage also downloads the splat plane and counts filled
+	// texels (extra copy in the SAME submit, plus a CPU scan): pass
+	// true in tests, sparingly (e.g. 1/60 warps) in the live path.
 	bool Warp(const Pose& srcPose, const Mat4 srcProj,
 	          const Pose& dstPose, const Mat4 dstProj,
-	          float holeRadius, std::vector<uint8_t>& outColor);
+	          float holeRadius, std::vector<uint8_t>& outColor,
+	          bool countCoverage = false);
 
 	// Fraction of target pixels that received at least one splat in
-	// the last Warp() (0..1). Useful for diagnosing empty warps.
+	// the last Warp() with countCoverage=true (0..1, expensive: see
+	// above). Only meaningful when the last Warp counted coverage.
 	float LastCoverage() const { return lastCoverage_; }
+
+	// Human-readable reason for the last Init/Upload/Warp failure.
+	const std::string& LastError() const { return lastError_; }
+
+	// Name of the selected physical device (empty until Init succeeds).
+	const std::string& DeviceName() const { return deviceName_; }
 
 private:
 	bool Fail(std::string* error, const std::string& msg);
@@ -87,7 +98,9 @@ private:
 	uint32_t width_ = 0;
 	uint32_t height_ = 0;
 	bool initialized_ = false;
-	float lastCoverage_ = 0.0f;
+	float lastCoverage_ = -1.0f;
+	std::string lastError_;
+	std::string deviceName_;
 
 	// Opaque Vulkan state (PIMPL to keep <vulkan/vulkan.h> out of the
 	// header). Public so the implementation's file-local helpers can

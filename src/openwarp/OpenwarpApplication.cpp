@@ -35,8 +35,11 @@ OpenwarpApplication::OpenwarpApplication(size_t meshSize, Backend backend_) : ba
                      "falling back to the OpenGL mesh path until the Vulkan backend lands."
                   << std::endl;
 #endif
-        // Raymarch has no Vulkan port (mesh warp only).
+        // Raymarch has no Vulkan port (mesh warp only). Vsync on: the
+        // uncapped swap loop tears badly with variable warp latency, and
+        // the ImGui toggle can still turn it off.
         useRay = false;
+        useVsync = true;
     }
 
     std::cout << "Initializing Openwarp";
@@ -184,6 +187,10 @@ void OpenwarpApplication::RunTest(const TestRun& testRun, std::string runDir, bo
         stbi_write_png(filename.c_str(), WIDTH, HEIGHT, 3, fb_data, WIDTH * sizeof(GLubyte) * 3);
 
         glfwSwapBuffers(window);
+        double instFps = 1.0 / (glfwGetTime() - lastSwapTime);
+        presentationFramerate =
+            (presentationFramerate <= 0.0) ? instFps : (0.95 * presentationFramerate + 0.05 * instFps);
+        lastSwapTime = glfwGetTime();
     }
 }
 
@@ -203,15 +210,17 @@ void OpenwarpApplication::Run(bool showGUI){
         processInput();
 
         // If it's time to render a frame (based on the desired render frequency)
-        // we render, and increment the next render time.
+        // we render, and schedule the next one from completion: with warps
+        // slower than the render interval, absolute scheduling would lag
+        // forever and render every iteration catching up (judder).
         if(glfwGetTime() >= nextRenderTime){
-            
+
             if(shouldRenderScene) {
                 renderScene();
             }
-            
-            nextRenderTime += renderInterval;
-            
+
+            nextRenderTime = glfwGetTime() + renderInterval;
+
         }
 
         // Reproject every frame.
@@ -227,7 +236,10 @@ void OpenwarpApplication::Run(bool showGUI){
             drawGUI();
         
         glfwSwapBuffers(window);
-        presentationFramerate = 1.0/(glfwGetTime() - lastSwapTime);
+        // EMA so the overlay doesn't swing wildly with variable warp time.
+        double instFps = 1.0 / (glfwGetTime() - lastSwapTime);
+        presentationFramerate =
+            (presentationFramerate <= 0.0) ? instFps : (0.95 * presentationFramerate + 0.05 * instFps);
         lastSwapTime = glfwGetTime();
     }
 }
@@ -425,6 +437,29 @@ bool OpenwarpApplication::EnsureVulkanWarp()
     }
     std::cout << "[vulkan] compute warp ready (" << WIDTH << "x" << HEIGHT << ", spv: " << spvDir
               << ")" << std::endl;
+    // Cross-check which GPU GL runs on vs Vulkan: on Optimus/PRIME they
+    // can differ (GL NVIDIA + Vk iGPU), which doubles PCIe traffic. Both
+    // names are logged; warn when they obviously disagree.
+    const char* glRenderer =
+        reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+    const std::string& vkDevice = vulkanWarp->DeviceName();
+    std::cout << "[vulkan] GL renderer: " << (glRenderer ? glRenderer : "<unknown>")
+              << " | Vk device: " << (vkDevice.empty() ? "<unknown>" : vkDevice) << std::endl;
+    auto mentions = [](const char* hay, const char* needle) {
+        return hay && std::strstr(hay, needle) != nullptr;
+    };
+    auto mentionsS = [](const std::string& hay, const char* needle) {
+        return hay.find(needle) != std::string::npos;
+    };
+    bool glNvidia = mentions(glRenderer, "NVIDIA");
+    bool vkNvidia = mentionsS(vkDevice, "NVIDIA");
+    if(glRenderer && !vkDevice.empty() && (glNvidia != vkNvidia)) {
+        std::cerr << "[vulkan] WARNING: GL and Vulkan look like different GPUs "
+                     "(GL " << (glNvidia ? "" : "not ") << "NVIDIA, Vk " << (vkNvidia ? "" : "not ")
+                  << "NVIDIA). Cross-GPU readbacks will hurt. "
+                     "Override with OPENWARP_VK_DEVICE=<index>."
+                  << std::endl;
+    }
     return true;
 }
 
@@ -433,20 +468,51 @@ bool OpenwarpApplication::doVulkanMeshWarp()
     if(!EnsureVulkanWarp())
         return false;
 
-    // Read back the GL-rendered scene. renderScene leaves renderFBO
-    // bound; row 0 here is the frustum bottom for both planes, which is
-    // exactly the row order the warp math assumes (clip y = guv*2-1).
-    std::vector<uint8_t> color(static_cast<size_t>(WIDTH) * HEIGHT * 4);
-    std::vector<float> depth(static_cast<size_t>(WIDTH) * HEIGHT);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, renderFBO);
-    glReadPixels(0, 0, WIDTH, HEIGHT, GL_RGBA, GL_UNSIGNED_BYTE, color.data());
-    glReadPixels(0, 0, WIDTH, HEIGHT, GL_DEPTH_COMPONENT, GL_FLOAT, depth.data());
-
-    if(!vulkanWarp->Upload(color.data(), depth.data())) {
-        std::cerr << "[vulkan] warp Upload failed; disabling." << std::endl;
-        vulkanFailed = true;
-        return false;
+    // Dirty tracking: the source frame only changes when renderScene runs
+    // (15 Hz). Re-upload then; re-warp only when the source or the target
+    // pose moved since the last warp. Otherwise the previously presented
+    // frame is still correct — skip everything (this is what keeps an
+    // uncapped present loop from re-warping identical frames at 1000 Hz).
+    bool poseMoved = !haveLastWarpPose || lastWarpPos != position || lastWarpQuat != orientation;
+    bool freshSource = (renderSeq != lastWarpRenderSeq);
+    if(!poseMoved && !freshSource) {
+        vulkanStats.skips++;
+        return true;
     }
+
+    double t0 = nowMs();
+
+    // (Re)size hoisted host buffers once, never in the hot path.
+    size_t px = static_cast<size_t>(WIDTH) * HEIGHT;
+    if(vulkanColor.size() != px * 4)
+        vulkanColor.resize(px * 4);
+    if(vulkanDepth.size() != px)
+        vulkanDepth.resize(px);
+    if(vulkanOut.size() != px * 4)
+        vulkanOut.resize(px * 4);
+
+    double tReadback = t0;
+    if(freshSource) {
+        // Read back the GL-rendered scene. renderScene leaves renderFBO
+        // bound; row 0 here is the frustum bottom for both planes, which is
+        // exactly the row order the warp math assumes (clip y = guv*2-1).
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, renderFBO);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(0, 0, WIDTH, HEIGHT, GL_RGBA, GL_UNSIGNED_BYTE, vulkanColor.data());
+        glReadPixels(0, 0, WIDTH, HEIGHT, GL_DEPTH_COMPONENT, GL_FLOAT, vulkanDepth.data());
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        tReadback = nowMs();
+
+        if(!vulkanWarp->Upload(vulkanColor.data(), vulkanDepth.data())) {
+            std::cerr << "[vulkan] Upload failed (" << vulkanWarp->LastError() << "); disabling."
+                      << std::endl;
+            vulkanFailed = true;
+            return false;
+        }
+        vulkanStats.uploads++;
+        lastWarpRenderSeq = renderSeq;
+    }
+    double tUpload = nowMs();
 
     // Source = rendered pose, target = current pose; same projection.
     // renderedCameraMatrix is camera-to-world (Translation * Rotation),
@@ -476,12 +542,24 @@ bool OpenwarpApplication::doVulkanMeshWarp()
     std::memcpy(srcProj, projection.data(), sizeof(srcProj));
     std::memcpy(dstProj, projection.data(), sizeof(dstProj));
 
-    std::vector<uint8_t> out;
-    if(!vulkanWarp->Warp(srcPose, srcProj, dstPose, dstProj, 4.0f, out)) {
-        std::cerr << "[vulkan] warp failed; disabling." << std::endl;
+    // Hole fill OFF (radius 0): unknown pixels stay black. The radius-4
+    // expanding-ring search costs up to 80 taps per hole pixel and
+    // dominates the pull pass on large disocclusions.
+    // Coverage is sampled (1/60 warps): same-submit copy, negligible cost.
+    bool wantCoverage = (vulkanStats.warps % 60) == 0;
+    if(!vulkanWarp->Warp(srcPose, srcProj, dstPose, dstProj, 0.0f, vulkanOut, wantCoverage)) {
+        std::cerr << "[vulkan] Warp failed (" << vulkanWarp->LastError() << "); disabling."
+                  << std::endl;
         vulkanFailed = true;
         return false;
     }
+    vulkanStats.warps++;
+    haveLastWarpPose = true;
+    lastWarpPos = position;
+    lastWarpQuat = orientation;
+    if(wantCoverage)
+        vulkanStats.lastCoverage = vulkanWarp->LastCoverage();
+    double tWarp = nowMs();
 
     // Present the warped result with a trivial GL textured quad.
     if(vulkanPresentTex == 0) {
@@ -503,19 +581,28 @@ bool OpenwarpApplication::doVulkanMeshWarp()
         glBindBuffer(GL_ARRAY_BUFFER, vulkanPresentVBO);
         glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
     }
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glBindTexture(GL_TEXTURE_2D, vulkanPresentTex);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, WIDTH, HEIGHT, GL_RGBA, GL_UNSIGNED_BYTE, out.data());
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, WIDTH, HEIGHT, GL_RGBA, GL_UNSIGNED_BYTE,
+                     vulkanOut.data());
 
+    // Draw at the real framebuffer size (HiDPI/compositor scaling maps
+    // 1:1 only if the viewport matches; a hardcoded 1024 viewport on a
+    // 2x surface would upscale blurry / fill a quarter).
+    int fbW = WIDTH;
+    int fbH = HEIGHT;
+    glfwGetFramebufferSize(window, &fbW, &fbH);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, WIDTH, HEIGHT);
+    glViewport(0, 0, fbW, fbH);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
     glUseProgram(vulkanPresentProgram);
-    GLint texLoc = glGetUniformLocation(vulkanPresentProgram, "present_tex");
-    if(texLoc >= 0) {
+    if(vulkanPresentTexLoc == -2)
+        vulkanPresentTexLoc = glGetUniformLocation(vulkanPresentProgram, "present_tex");
+    if(vulkanPresentTexLoc >= 0) {
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, vulkanPresentTex);
-        glUniform1i(texLoc, 0);
+        glUniform1i(vulkanPresentTexLoc, 0);
     }
     glBindVertexArray(vulkanPresentVAO);
     glBindBuffer(GL_ARRAY_BUFFER, vulkanPresentVBO);
@@ -525,6 +612,26 @@ bool OpenwarpApplication::doVulkanMeshWarp()
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glBindVertexArray(0);
+    double tPresent = nowMs();
+
+    vulkanStats.readbackMs += (tReadback - t0);
+    vulkanStats.uploadMs += (tUpload - tReadback);
+    vulkanStats.warpMs += (tWarp - tUpload);
+    vulkanStats.presentMs += (tPresent - tWarp);
+
+    // Paced profiling: proves the Vulkan pipeline renders + shows where
+    // time goes (rendering vs shading vs copies). Every ~2 s.
+    if(tPresent - vulkanStatsLastLog > 2000.0) {
+        vulkanStatsLastLog = tPresent;
+        uint64_t n = vulkanStats.warps ? vulkanStats.warps : 1;
+        std::cout << "[vulkan] stats: warps=" << vulkanStats.warps
+                  << " uploads=" << vulkanStats.uploads << " skips=" << vulkanStats.skips
+                  << " | ms/warp readback=" << vulkanStats.readbackMs / n
+                  << " upload=" << vulkanStats.uploadMs / n << " gpu-warp=" << vulkanStats.warpMs / n
+                  << " present=" << vulkanStats.presentMs / n
+                  << " | coverage=" << vulkanStats.lastCoverage
+                  << " | present-fps=" << presentationFramerate << std::endl;
+    }
     return true;
 }
 #endif // OPENWARP_HAS_VULKAN
@@ -629,6 +736,10 @@ void OpenwarpApplication::renderScene(){
     // Render to FBO.
     glBindVertexArray(demoVAO);
     glUseProgram(demoShaderProgram);
+#ifdef OPENWARP_HAS_VULKAN
+    // Fresh source for the Vulkan warp path (dirty tracking).
+    renderSeq++;
+#endif
 
     // If reprojection is disabled, we render straight to the screen.
     if (shouldReproject)
@@ -678,7 +789,7 @@ int OpenwarpApplication::initGL(){
     createRenderTexture(&depthTexture, WIDTH, HEIGHT, true);
 
     // Create FBO that will render to them!
-    createFBO(&renderTexture, &renderFBO, &depthTexture, &renderDepthTarget, WIDTH, HEIGHT);
+    createFBO(&renderTexture, &renderFBO, &depthTexture, WIDTH, HEIGHT);
 
     // Load the .obj-file-based that will be rendered for the demo scene.
     demoscene = ObjScene(std::string(OBJ_DIR), "scene.obj");

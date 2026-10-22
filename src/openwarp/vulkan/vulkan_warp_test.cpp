@@ -112,7 +112,7 @@ int main(int argc, char** argv)
 
 	// Test 1: identity warp must reproduce the input.
 	std::vector<uint8_t> idOut;
-	if (!warp.Warp(identity, proj, identity, proj, 4.0f, idOut)) {
+	if (!warp.Warp(identity, proj, identity, proj, 0.0f, idOut, true)) {
 		std::cerr << "identity Warp() failed" << std::endl;
 		return 1;
 	}
@@ -128,7 +128,7 @@ int main(int argc, char** argv)
 	openwarp_vk::Pose shifted = identity;
 	shifted.pos[0] = 0.15f;
 	std::vector<uint8_t> shiftOut;
-	if (!warp.Warp(identity, proj, shifted, proj, 4.0f, shiftOut)) {
+	if (!warp.Warp(identity, proj, shifted, proj, 0.0f, shiftOut, true)) {
 		std::cerr << "shifted Warp() failed" << std::endl;
 		return 1;
 	}

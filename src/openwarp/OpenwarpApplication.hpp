@@ -117,12 +117,38 @@ class Openwarp::OpenwarpApplication{
         GLint vulkanPresentProgram = 0;
         GLuint vulkanPresentVAO = 0;
         GLuint vulkanPresentVBO = 0;
+        GLint vulkanPresentTexLoc = -2; // -2 = unqueried
+        // Hoisted per-warp host buffers (4 MiB each at 1024x1024): never
+        // allocate in the hot path.
+        std::vector<uint8_t> vulkanColor;
+        std::vector<float> vulkanDepth;
+        std::vector<uint8_t> vulkanOut;
+        // Dirty tracking: the source only changes when renderScene runs
+        // (15 Hz); re-warp only when the source or the target pose moved.
+        uint64_t renderSeq = 0;
+        uint64_t lastWarpRenderSeq = 0;
+        bool haveLastWarpPose = false;
+        Eigen::Vector3f lastWarpPos = Eigen::Vector3f::Zero();
+        Eigen::Quaternionf lastWarpQuat = Eigen::Quaternionf::Identity();
+        // Paced profiling: per-stage CPU ms + counts, logged every ~2 s.
+        struct VulkanStats {
+            uint64_t warps = 0;
+            uint64_t uploads = 0;
+            uint64_t skips = 0;
+            double readbackMs = 0.0;
+            double uploadMs = 0.0;
+            double warpMs = 0.0;
+            double presentMs = 0.0;
+            float lastCoverage = -1.0f;
+        } vulkanStats;
+        double vulkanStatsLastLog = 0.0;
         bool EnsureVulkanWarp();
         bool doVulkanMeshWarp();
+        static double nowMs() { return glfwGetTime() * 1000.0; }
 #endif
 
-        double lastSwapTime;
-        double presentationFramerate;
+        double lastSwapTime = 0.0;
+        double presentationFramerate = 0.0;
 
         // GLFW resources
         GLFWwindow* window;
@@ -136,7 +162,6 @@ class Openwarp::OpenwarpApplication{
         GLuint renderTexture;
         GLuint depthTexture;
         GLuint renderFBO;
-        GLuint renderDepthTarget;
         GLint demoShaderProgram;
         GLuint demoVAO;
 
@@ -289,13 +314,16 @@ class Openwarp::OpenwarpApplication{
 
             // We use GL_NEAREST for depth textures for performance reasons.
             // Linear filtering on depth textures is (apparently) costly.
+            // (Single level, no mipmaps anywhere in this app.)
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, isDepth ? GL_NEAREST : GL_LINEAR_MIPMAP_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, isDepth ? GL_NEAREST : GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
             if(isDepth) {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32, width, height, 0, GL_DEPTH_COMPONENT, GL_FLOAT, 0);
+                // 32F float depth: matches the float readback + R32_SFLOAT
+                // Vulkan side with no fixed-point quantization.
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, width, height, 0, GL_DEPTH_COMPONENT, GL_FLOAT, 0);
             }
             else {
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, 0);
@@ -310,16 +338,11 @@ class Openwarp::OpenwarpApplication{
             }
         }
 
-        void createFBO(GLuint* texture_handle, GLuint* fbo, GLuint* depth_texture_handle, GLuint* depth_target, GLuint width, GLuint height){
+        void createFBO(GLuint* texture_handle, GLuint* fbo, GLuint* depth_texture_handle, GLuint width, GLuint height){
             // Create a framebuffer to draw some things to the eye texture
             glGenFramebuffers(1, fbo);
             // Bind the FBO as the active framebuffer.
             glBindFramebuffer(GL_FRAMEBUFFER, *fbo);
-
-            glGenRenderbuffers(1, depth_target);
-            glBindRenderbuffer(GL_RENDERBUFFER, *depth_target);
-            glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT, width, height);
-            glBindRenderbuffer(GL_RENDERBUFFER, 0);
 
             // Attach color texture to color attachment.
             glBindTexture(GL_TEXTURE_2D, *texture_handle);
@@ -330,6 +353,13 @@ class Openwarp::OpenwarpApplication{
             glBindTexture(GL_TEXTURE_2D, *depth_texture_handle);
             glFramebufferTexture(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, *depth_texture_handle, 0);
             glBindTexture(GL_TEXTURE_2D, 0);
+
+            GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+            if(status != GL_FRAMEBUFFER_COMPLETE) {
+                std::cerr << "[fbo] render target incomplete: 0x" << std::hex << status << std::dec
+                          << std::endl;
+                abort();
+            }
 
             if(glGetError()){
                 abort();
