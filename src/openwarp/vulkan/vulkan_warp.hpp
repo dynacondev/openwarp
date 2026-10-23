@@ -72,6 +72,13 @@ public:
 	// 0..1 nonlinear float. Returns false on failure.
 	bool Upload(const uint8_t* colorRGBA, const float* depth);
 
+	// Hole-fill background weighting exponent: pull stores
+	// (rgb*w, w) with w = pow(depth, p), so the mip average is biased
+	// toward background (deep) pixels and the occluding foreground
+	// stops smearing into disocclusions. p = 0 restores the uniform
+	// average. Tunable at runtime; takes effect on the next Warp().
+	void SetFillWeightPow(float p) { fillWeightPow_ = p; }
+
 	// Warp the uploaded frame from (srcPose, srcProj) to
 	// (dstPose, dstProj) and download the RGB8 result into outColor
 	// (width*height*4 bytes). holeRadius > 0 enables the mip-chain hole
@@ -122,6 +129,7 @@ private:
 	uint32_t width_ = 0;
 	uint32_t height_ = 0;
 	bool initialized_ = false;
+	float fillWeightPow_ = 1.0f;
 	float lastCoverage_ = -1.0f;
 	GpuTimes lastGpu_{};
 	std::vector<uint32_t> lastSplat_;

@@ -29,6 +29,8 @@ struct SplatUBO {
 struct PullUBO {
 	float dstInv[16];
 	float srcVP[16];
+	// x: fill weight exponent p (w = pow(depth, p)); yzw: reserved.
+	float tune[4];
 };
 
 } // namespace
@@ -1030,6 +1032,8 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 	Multiply(dstProj, viewDst, splatUbo.warpVP);
 	Multiply(dstInvV, dstInvP, pullUbo.dstInv);
 	Multiply(srcProj, viewSrc, pullUbo.srcVP);
+	pullUbo.tune[0] = fillWeightPow_;
+	pullUbo.tune[1] = pullUbo.tune[2] = pullUbo.tune[3] = 0.0f;
 	std::memcpy(s->uboSplat.mapped, &splatUbo, sizeof(splatUbo));
 	std::memcpy(s->uboPull.mapped, &pullUbo, sizeof(pullUbo));
 
@@ -1114,28 +1118,31 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 		}
 		if (s->hasTimestamps)
 			vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 4);
-		// Mip levels 1..N become shader-readable for the fill tap.
-		Transition(s, s->dst, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		           VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 1,
-		           s->mipLevels - 1);
-		// Level 0 back to GENERAL for fill writes.
-		Transition(s, s->dst, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
-		           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1);
-		vkCmdBindPipeline(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s->fillPipe);
-		vkCmdBindDescriptorSets(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s->fillPipeLayout, 0, 1,
-		                        &s->fillSet, 0, nullptr);
-		// View-relative LOD cap: view covers levels 1..N, so max lod is N-2.
-		int32_t maxViewLod = static_cast<int32_t>(s->mipLevels) - 2;
-		vkCmdPushConstants(s->cmd, s->fillPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-		                   sizeof(maxViewLod), &maxViewLod);
-		vkCmdDispatch(s->cmd, gx, gy, 1);
-		if (s->hasTimestamps)
-			vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 5);
 	} else if (s->hasTimestamps) {
-		// Keep query indices stable when fill is off.
+		// Keep query indices stable when the blit chain is skipped.
 		vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 4);
-		vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 5);
 	}
+
+	// Fill always runs: valid pixels are un-premultiplied here, and
+	// holes are patched when the mip chain was built above (or kept
+	// black when hole-filling is off).
+	// Mip levels 1..N become shader-readable for the fill tap.
+	Transition(s, s->dst, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	           VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 1,
+	           s->mipLevels - 1);
+	// Level 0 back to GENERAL for fill writes.
+	Transition(s, s->dst, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
+	           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1);
+	vkCmdBindPipeline(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s->fillPipe);
+	vkCmdBindDescriptorSets(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s->fillPipeLayout, 0, 1,
+	                        &s->fillSet, 0, nullptr);
+	// View-relative LOD cap: view covers levels 1..N, so max lod is N-2.
+	int32_t maxViewLod = doFill ? static_cast<int32_t>(s->mipLevels) - 2 : -1;
+	vkCmdPushConstants(s->cmd, s->fillPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+	                   sizeof(maxViewLod), &maxViewLod);
+	vkCmdDispatch(s->cmd, gx, gy, 1);
+	if (s->hasTimestamps)
+		vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 5);
 
 	// Read back dst (and the splat plane for coverage, same submit).
 	Transition(s, s->dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,

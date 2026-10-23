@@ -37,9 +37,24 @@ void main()
 	ivec2 size = imageSize(dstImg);
 	if (xy.x >= size.x || xy.y >= size.y)
 		return;
-	// Valid pixels keep the pull result untouched.
-	if (imageLoad(splatDepth, xy).x != SPLAT_EMPTY)
+	// Valid pixels only need un-premultiplying (divide out the
+	// background weight); the color itself is already right. This also
+	// runs when hole-filling is off, so the no-fill path still shows
+	// straight colors instead of the premultiplied darkening.
+	if (imageLoad(splatDepth, xy).x != SPLAT_EMPTY) {
+		vec4 v = imageLoad(dstImg, xy);
+		if (v.a >= VALID_EPS) {
+			imageStore(dstImg, xy, vec4(v.rgb / v.a, 1.0));
+			return;
+		}
+		// Near-zero weight (depth ~= 0): fall through to the fill.
+	}
+
+	// Fill disabled: holes keep the pull result (black).
+	if (pc.maxViewLod < 0) {
+		imageStore(dstImg, xy, vec4(0.0));
 		return;
+	}
 
 	vec2 tuv = (vec2(xy) + vec2(0.5)) / vec2(size);
 	int lodB = min(5, pc.maxViewLod);

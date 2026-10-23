@@ -142,48 +142,82 @@ int main(int argc, char** argv)
 		ok = false;
 	}
 
-	// Test 4: pyramid fill. Same shifted warp with fill enabled: the
-	// disoccluded square interior must be patched with a local average
-	// (far fewer pure-black pixels than the unfilled run above), while
-	// valid pixels stay bit-identical to the unfilled result.
+	// Test 4: background-weighted fill sweep over p in {0, 1, 2}. For
+	// each power: A = normalize-only (holes stay black), B = normalize
+	// + fill. Valid pixels take the identical normalize path in both,
+	// so A/B must match bit-exactly; holes must vanish in B; and hole
+	// whiteness must drop with p (background bias suppresses the white
+	// foreground square).
 	if (!warp.Upload(color.data(), depth.data())) {
 		std::cerr << "refill Upload failed" << std::endl;
 		return 1;
 	}
-	std::vector<uint8_t> shiftFilled;
-	if (!warp.Warp(identity, proj, shifted, proj, 1.0f, shiftFilled, true)) {
-		std::cerr << "filled Warp() failed" << std::endl;
-		return 1;
+	// Mean brightness over the holes of the unfilled run (same region
+	// every time, so powers are comparable).
+	auto holeWhiteness = [&](const std::vector<uint8_t>& img,
+	                         const std::vector<uint8_t>& holes) {
+		double wsum = 0.0;
+		size_t wn = 0;
+		for (size_t px = 0; px < kSize * kSize; px++) {
+			if (holes[4 * px] == 0 && holes[4 * px + 1] == 0 && holes[4 * px + 2] == 0) {
+				wsum += (img[4 * px] + img[4 * px + 1] + img[4 * px + 2]) / 3.0;
+				wn++;
+			}
+		}
+		return wn ? wsum / wn : 0.0;
+	};
+	std::vector<double> whiteByP;
+	for (float pwr : {0.0f, 1.0f, 2.0f}) {
+		warp.SetFillWeightPow(pwr);
+		std::vector<uint8_t> nofill, filled;
+		if (!warp.Warp(identity, proj, shifted, proj, 0.0f, nofill, false)) {
+			std::cerr << "nofill Warp() failed" << std::endl;
+			return 1;
+		}
+		if (!warp.Warp(identity, proj, shifted, proj, 1.0f, filled, true)) {
+			std::cerr << "filled Warp() failed" << std::endl;
+			return 1;
+		}
+		double filledBlack = BlackFraction(filled);
+		double W = holeWhiteness(filled, nofill);
+		std::cout << "[filled p=" << pwr << "] blackFrac=" << filledBlack << " holeWhiteness=" << W
+		          << " (nofill black was " << BlackFraction(nofill) << ")" << std::endl;
+		if (!(filledBlack < 0.15)) {
+			std::cerr << "FAIL: fill did not reduce black at p=" << pwr << std::endl;
+			ok = false;
+		}
+		{
+			// Same normalize path both sides: valid pixels (anything
+			// non-black in nofill) must match bit-exactly.
+			double validDiff = 0.0;
+			size_t validCount = 0;
+			for (size_t px = 0; px < kSize * kSize; px++) {
+				bool hole = (nofill[4 * px] == 0 && nofill[4 * px + 1] == 0 &&
+				             nofill[4 * px + 2] == 0);
+				if (!hole) {
+					for (int c = 0; c < 4; c++) {
+						validDiff += std::abs(static_cast<int>(nofill[4 * px + c]) -
+						                      static_cast<int>(filled[4 * px + c]));
+						validCount++;
+					}
+				}
+			}
+			validDiff /= validCount ? static_cast<double>(validCount) : 1.0;
+			std::cout << "[filled p=" << pwr << "] valid-pixel meanAbsDiff=" << validDiff << std::endl;
+			if (!(validDiff < 1e-6)) {
+				std::cerr << "FAIL: fill pass altered valid pixels at p=" << pwr << std::endl;
+				ok = false;
+			}
+		}
+		whiteByP.push_back(W);
+		std::string pname = outDir + "/shifted_filled_p" + std::to_string(int(pwr)) + ".png";
+		stbi_write_png(pname.c_str(), kSize, kSize, 4, filled.data(), kSize * 4);
 	}
-	double filledBlack = BlackFraction(shiftFilled);
-	std::cout << "[filled] blackFrac=" << filledBlack << " (unfilled was " << blackFrac << ")"
-	          << std::endl;
-	if (!(filledBlack < 0.15 && filledBlack < blackFrac * 0.5)) {
-		std::cerr << "FAIL: pyramid fill did not reduce black (filled<0.15, halved required)"
+	if (!(whiteByP.size() == 3 && whiteByP[2] < whiteByP[0])) {
+		std::cerr << "FAIL: background weighting did not reduce hole whiteness with p"
 		          << std::endl;
 		ok = false;
 	}
-	{
-		// Valid pixels must be untouched by the fill pass.
-		double validDiff = 0.0;
-		size_t validCount = 0;
-		for (size_t i = 0; i < shiftOut.size(); i++) {
-			bool wasBlack = (shiftOut[i] == 0);
-			if (!wasBlack) {
-				validDiff += std::abs(static_cast<int>(shiftOut[i]) -
-				                       static_cast<int>(shiftFilled[i]));
-				validCount++;
-			}
-		}
-		validDiff /= validCount ? static_cast<double>(validCount) : 1.0;
-		std::cout << "[filled] valid-pixel meanAbsDiff=" << validDiff << std::endl;
-		if (!(validDiff < 1e-6)) {
-			std::cerr << "FAIL: fill pass altered valid pixels" << std::endl;
-			ok = false;
-		}
-	}
-	stbi_write_png((outDir + "/shifted_filled.png").c_str(), kSize, kSize, 4, shiftFilled.data(),
-	               kSize * 4);
 
 	stbi_write_png((outDir + "/input.png").c_str(), kSize, kSize, 4, color.data(), kSize * 4);
 	stbi_write_png((outDir + "/identity.png").c_str(), kSize, kSize, 4, idOut.data(), kSize * 4);

@@ -264,6 +264,12 @@ void OpenwarpApplication::drawGUI(){
             ImGui::PopItemWidth();
         }
         ImGui::Checkbox("Show grid debug overlay", &showDebugGrid);
+        if (backend == Backend::Vulkan) {
+            ImGui::Text("Fill background weight power");
+            ImGui::PushItemWidth(-1);
+            ImGui::SliderFloat("##vkfill", &vulkanFillPower, 0.0f, 3.0f);
+            ImGui::PopItemWidth();
+        }
     
         ImGui::End();
     }
@@ -561,6 +567,7 @@ bool OpenwarpApplication::doVulkanMeshWarp()
     // expanding-ring search grew with hole width and smeared edges.
     // Coverage is sampled (1/60 warps): same-submit copy, negligible cost.
     bool wantCoverage = (vulkanStats.warps % 60) == 0;
+    vulkanWarp->SetFillWeightPow(vulkanFillPower);
     if(!vulkanWarp->Warp(srcPose, srcProj, dstPose, dstProj, vulkanHoleFill, vulkanOut,
                          wantCoverage)) {
         std::cerr << "[vulkan] Warp failed (" << vulkanWarp->LastError() << "); disabling."

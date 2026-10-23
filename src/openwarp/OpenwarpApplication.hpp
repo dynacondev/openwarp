@@ -150,9 +150,13 @@ class Openwarp::OpenwarpApplication{
         } vulkanStats;
         bool vulkanDepthLogged = false;
         uint64_t vulkanDumpCount = 0;
-        // Pyramid hole fill: >0 enables (blurred local-average fill of
-        // disocclusions, constant cost/hole). 0 leaves them black.
+        // Mip-chain hole fill: >0 enables (blurred local-average fill
+        // of disocclusions, constant cost/hole). 0 leaves them black.
         float vulkanHoleFill = 1.0f;
+        // Background weight exponent for the fill (w = pow(depth, p)):
+        // higher p suppresses foreground smear into holes harder.
+        // 0 = uniform average. Runtime-tunable, tested at 0/1/2.
+        float vulkanFillPower = 1.0f;
         double vulkanStatsLastLog = 0.0;
         bool EnsureVulkanWarp();
         bool doVulkanMeshWarp();

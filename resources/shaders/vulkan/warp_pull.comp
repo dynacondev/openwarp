@@ -24,6 +24,8 @@ layout(set = 0, binding = 1) uniform PullUBO
 {
 	mat4 dstInv; // target clip -> world (inverse view * inverse projection, folded on CPU)
 	mat4 srcVP; // source projection * source view, folded on CPU
+	// x: background weight exponent (w = pow(depth, p)); 0 = uniform.
+	vec4 fillTune;
 } ubo;
 
 layout(set = 0, binding = 2, r32ui) uniform uimage2D splatDepth;
@@ -61,10 +63,11 @@ void main()
 
 	vec2 suv = vec2(0.0);
 	bool ok = false;
+	float depth = 1.0;
 
 	uint enc = imageLoad(splatDepth, dstXY).x;
 	if (enc != SPLAT_EMPTY) {
-		float depth = float(enc) / DEPTH_SCALE;
+		depth = float(enc) / DEPTH_SCALE;
 		if (sourceUV(tuv, depth, suv) && inBounds(suv))
 			ok = true;
 	}
@@ -79,6 +82,11 @@ void main()
 		return;
 	}
 
+	// Background-weighted premultiplied output: the mip average is
+	// then biased toward deep pixels, so the occluding foreground
+	// stops smearing into disocclusions. p = 0 restores uniform.
 	vec4 color = texture(srcColor, suv);
-	imageStore(dstColor, dstXY, vec4(color.rgb, 1.0));
+	float p = ubo.fillTune.x;
+	float w = (p <= 0.0) ? 1.0 : pow(clamp(depth, 1e-6, 1.0), p);
+	imageStore(dstColor, dstXY, vec4(color.rgb * w, w));
 }
