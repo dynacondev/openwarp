@@ -119,8 +119,13 @@ class Openwarp::OpenwarpApplication{
             MipChain = 1, // blit mip-chain blurred local average
             DepthGuided = 2, // depth-guided local average + mip fallback
             Stretch = 3,  // background stretch (deepest nearby donor) + mip fallback
+            DirectionalMarch = 4, // 1D BG march (nearest BG texel per ray) + mip fallback
+            BgExtrapolate = 5, // hard 1-sided BG extend + mip fallback
+            BilateralGather = 6, // G-buffer bilateral gather + mip fallback
         };
-        static constexpr int kVulkanFillCount = 4;
+        static constexpr int kVulkanFillCount = 7;
+        static VulkanFillMethod VulkanFillByIndex(int i);
+        static int VulkanFillIndex(VulkanFillMethod m);
         static const char* VulkanFillName(VulkanFillMethod m);
         void CycleVulkanFill(int dir = 1);
         float VulkanFillHoleRadius() const;
@@ -181,6 +186,11 @@ class Openwarp::OpenwarpApplication{
         // used by Stretch): larger r stretches wider disocclusions but
         // costs more per hole pixel.
         int vulkanStretchRadius = 4;
+        // Temporal BG cache (persistent half-res background layer,
+        // projected into holes BEFORE the fill pass, so it sits
+        // underneath every fill method above). Toggle takes effect on
+        // the next warp; Upload re-primes on the next static frame.
+        bool vulkanTemporalCache = false;
         double vulkanStatsLastLog = 0.0;
         bool EnsureVulkanWarp();
         // 1 = presented, 0 = skipped identical frame, -1 = failed.
