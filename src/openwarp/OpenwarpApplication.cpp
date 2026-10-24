@@ -29,6 +29,7 @@ const char* OpenwarpApplication::VulkanFillName(VulkanFillMethod m)
     switch (m) {
     case VulkanFillMethod::Off: return "Off (black)";
     case VulkanFillMethod::MipChain: return "Mip-chain blur";
+    case VulkanFillMethod::DepthGuided: return "Depth-guided blur";
     default: return "<unknown>";
     }
 }
@@ -46,12 +47,24 @@ float OpenwarpApplication::VulkanFillHoleRadius() const
 {
     // Maps the fill selector onto the VulkanWarp::Warp() holeRadius
     // knob (>0 builds/samples the mip chain, 0 leaves holes black).
-    // Future fills that need the chain return >0 here; fills that work
-    // purely in-shader return 0 and branch in doVulkanMeshWarp().
+    // Fills that need the chain for fallback return >0 here; pure
+    // in-shader fills return 0 and branch in doVulkanMeshWarp().
     switch (vulkanFill) {
     case VulkanFillMethod::Off: return 0.0f;
     case VulkanFillMethod::MipChain: return 1.0f;
+    case VulkanFillMethod::DepthGuided: return 1.0f;
     default: return 0.0f;
+    }
+}
+
+int OpenwarpApplication::VulkanFillMode() const
+{
+    // Maps onto the warp_fill.comp fillMode push constant.
+    switch (vulkanFill) {
+    case VulkanFillMethod::DepthGuided: return 1;
+    case VulkanFillMethod::Off:
+    case VulkanFillMethod::MipChain:
+    default: return 0;
     }
 }
 
@@ -319,8 +332,9 @@ void OpenwarpApplication::drawGUI(){
                 vulkanFill = m;
         }
         // Mip-chain-only tuning: only shown for fills that use it, so
-        // dead knobs never look live.
-        if (vulkanFill == VulkanFillMethod::MipChain) {
+        // dead knobs never look live. DepthGuided blends the same
+        // premultiplied weights, so the power applies to it too.
+        if (vulkanFill != VulkanFillMethod::Off) {
             ImGui::Text("Fill background weight power");
             ImGui::PushItemWidth(-1);
             ImGui::SliderFloat("##vkfill", &vulkanFillPower, 0.0f, 3.0f);
@@ -636,6 +650,7 @@ bool OpenwarpApplication::doVulkanMeshWarp()
     // Coverage is sampled (1/60 warps): same-submit copy, negligible cost.
     bool wantCoverage = (vulkanStats.warps % 60) == 0;
     vulkanWarp->SetFillWeightPow(vulkanFillPower);
+    vulkanWarp->SetFillMode(VulkanFillMode());
     if(!vulkanWarp->Warp(srcPose, srcProj, dstPose, dstProj, VulkanFillHoleRadius(), vulkanOut,
                          wantCoverage)) {
         std::cerr << "[vulkan] Warp failed (" << vulkanWarp->LastError() << "); disabling."

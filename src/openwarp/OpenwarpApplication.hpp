@@ -117,11 +117,13 @@ class Openwarp::OpenwarpApplication{
         enum class VulkanFillMethod : int {
             Off = 0,      // holes stay black (honest baseline for A/B)
             MipChain = 1, // blit mip-chain blurred local average
+            DepthGuided = 2, // depth-guided local average + mip fallback
         };
-        static constexpr int kVulkanFillCount = 2;
+        static constexpr int kVulkanFillCount = 3;
         static const char* VulkanFillName(VulkanFillMethod m);
         void CycleVulkanFill(int dir = 1);
         float VulkanFillHoleRadius() const;
+        int VulkanFillMode() const;
         VulkanFillMethod vulkanFill = VulkanFillMethod::MipChain;
 
 #ifdef OPENWARP_HAS_VULKAN
