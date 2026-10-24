@@ -24,6 +24,37 @@ using namespace Openwarp;
 
 OpenwarpApplication* OpenwarpApplication::instance;
 
+const char* OpenwarpApplication::VulkanFillName(VulkanFillMethod m)
+{
+    switch (m) {
+    case VulkanFillMethod::Off: return "Off (black)";
+    case VulkanFillMethod::MipChain: return "Mip-chain blur";
+    default: return "<unknown>";
+    }
+}
+
+void OpenwarpApplication::CycleVulkanFill(int dir)
+{
+    int v = static_cast<int>(vulkanFill) + dir;
+    v %= kVulkanFillCount;
+    if (v < 0)
+        v += kVulkanFillCount;
+    vulkanFill = static_cast<VulkanFillMethod>(v);
+}
+
+float OpenwarpApplication::VulkanFillHoleRadius() const
+{
+    // Maps the fill selector onto the VulkanWarp::Warp() holeRadius
+    // knob (>0 builds/samples the mip chain, 0 leaves holes black).
+    // Future fills that need the chain return >0 here; fills that work
+    // purely in-shader return 0 and branch in doVulkanMeshWarp().
+    switch (vulkanFill) {
+    case VulkanFillMethod::Off: return 0.0f;
+    case VulkanFillMethod::MipChain: return 1.0f;
+    default: return 0.0f;
+    }
+}
+
 OpenwarpApplication::OpenwarpApplication(size_t meshSize, Backend backend_) : backend(backend_){
 
     // For static callbacks.
@@ -249,8 +280,13 @@ void OpenwarpApplication::drawGUI(){
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
-    
-    if(showMeshConfig) {
+
+    const bool isVulkan = (backend == Backend::Vulkan);
+
+    // GL-only windows: both are disconnected in Vulkan mode (GL mesh
+    // bleed uniforms and raymarch uniforms are never uploaded there),
+    // so hide them instead of showing dead sliders.
+    if(showMeshConfig && !isVulkan) {
         ImGui::SetNextWindowPos(ImVec2(0, 1024), ImGuiCond_Once, ImVec2(0.0f, 1.0f));
         ImGui::SetNextWindowSize(ImVec2(300,250), ImGuiCond_Always);
         
@@ -264,17 +300,39 @@ void OpenwarpApplication::drawGUI(){
             ImGui::PopItemWidth();
         }
         ImGui::Checkbox("Show grid debug overlay", &showDebugGrid);
-        if (backend == Backend::Vulkan) {
+        ImGui::End();
+    }
+
+    // Vulkan-only window: replaces the raymarch-vs-mesh selector. One
+    // radio per fill method so methods can be A/B'd side by side; add
+    // new methods as new radios + their tuning widgets below.
+    if (showVulkanFillConfig && isVulkan) {
+        ImGui::SetNextWindowPos(ImVec2(0, 1024), ImGuiCond_Once, ImVec2(0.0f, 1.0f));
+        ImGui::SetNextWindowSize(ImVec2(300, 250), ImGuiCond_Always);
+
+        ImGui::Begin("Vulkan fill", &showVulkanFillConfig, ImGuiWindowFlags_NoResize);
+        ImGui::Text("Fill method (T cycles)");
+        for (int i = 0; i < kVulkanFillCount; i++) {
+            auto m = static_cast<VulkanFillMethod>(i);
+            bool active = (vulkanFill == m);
+            if (ImGui::RadioButton(VulkanFillName(m), active))
+                vulkanFill = m;
+        }
+        // Mip-chain-only tuning: only shown for fills that use it, so
+        // dead knobs never look live.
+        if (vulkanFill == VulkanFillMethod::MipChain) {
             ImGui::Text("Fill background weight power");
             ImGui::PushItemWidth(-1);
             ImGui::SliderFloat("##vkfill", &vulkanFillPower, 0.0f, 3.0f);
             ImGui::PopItemWidth();
+        } else {
+            ImGui::TextWrapped("Fill has no tunable parameters.");
         }
-    
+
         ImGui::End();
     }
 
-    if(showRayConfig) {
+    if(showRayConfig && !isVulkan) {
         ImGui::SetNextWindowPos(ImVec2(300, 1024), ImGuiCond_Once, ImVec2(0.0f, 1.0f));
         ImGui::SetNextWindowSize(ImVec2(300,250), ImGuiCond_Always);
         
@@ -317,15 +375,21 @@ void OpenwarpApplication::drawGUI(){
     ImGui::Text("Presentation framerate: ");
     ImGui::SameLine();
     ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "%.2f hz", (float)presentationFramerate);
-    ImGui::Text("Current reprojection algo: ");
-    ImGui::SameLine();
-    ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), useRay ? "Raymarch-based" : "Mesh-based");
+    if (isVulkan) {
+        ImGui::Text("Current fill: ");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "%s", VulkanFillName(vulkanFill));
+    } else {
+        ImGui::Text("Current reprojection algo: ");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), useRay ? "Raymarch-based" : "Mesh-based");
+    }
     ImGui::Text("Is reprojecting? ");
     ImGui::SameLine();
     ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), shouldReproject ? "Yes" : "No");
     ImGui::Text("Mesh size: ");
     ImGui::SameLine();
-    if(useRay) {
+    if(isVulkan || useRay) {
         ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "N/A");
     } else {
         ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "%d x %d", meshWidth, meshHeight);
@@ -363,7 +427,11 @@ void OpenwarpApplication::drawGUI(){
     ImGui::Text("Toggle rendering: ");
     ImGui::SameLine();
     ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "F");
-    ImGui::Text("Switch reprojection type: ");
+    if (isVulkan) {
+        ImGui::Text("Switch fill method: ");
+    } else {
+        ImGui::Text("Switch reprojection type: ");
+    }
     ImGui::SameLine();
     ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "T");
     ImGui::Text("Toggle reprojection: ");
@@ -562,13 +630,13 @@ bool OpenwarpApplication::doVulkanMeshWarp()
     std::memcpy(srcProj, projection.data(), sizeof(srcProj));
     std::memcpy(dstProj, projection.data(), sizeof(dstProj));
 
-    // Hole fill: pyramid local-average of valid neighbors (blurred,
-    // never stretched). 0 = honest black for A/B. The old
+    // Hole fill dispatch: Off maps to holeRadius 0 (honest black for
+    // A/B); averaging fills build/sample the mip chain. The old
     // expanding-ring search grew with hole width and smeared edges.
     // Coverage is sampled (1/60 warps): same-submit copy, negligible cost.
     bool wantCoverage = (vulkanStats.warps % 60) == 0;
     vulkanWarp->SetFillWeightPow(vulkanFillPower);
-    if(!vulkanWarp->Warp(srcPose, srcProj, dstPose, dstProj, vulkanHoleFill, vulkanOut,
+    if(!vulkanWarp->Warp(srcPose, srcProj, dstPose, dstProj, VulkanFillHoleRadius(), vulkanOut,
                          wantCoverage)) {
         std::cerr << "[vulkan] Warp failed (" << vulkanWarp->LastError() << "); disabling."
                   << std::endl;

@@ -64,6 +64,7 @@ class Openwarp::OpenwarpApplication{
 
         bool showMeshConfig = true;
         bool showRayConfig = true;
+        bool showVulkanFillConfig = true;
         bool useVsync = false;
 
         // Rendering backend selected via --vulkan. OpenGL is the full
@@ -104,6 +105,24 @@ class Openwarp::OpenwarpApplication{
         bool shouldRenderScene = true;
         bool shouldReproject = true;
         bool useRay = false;
+
+        // Vulkan hole-fill selector (Vulkan mode only). Replaces the
+        // GL raymarch-vs-mesh toggle: Mesh/Ray windows and the T-key
+        // reprojection switch are hidden/disabled under --vulkan, and T
+        // cycles this list instead. To add a fill type: append a value
+        // here, extend VulkanFillName() + VulkanFillHoleRadius() in the
+        // .cpp, and add its tuning widgets to the "Vulkan fill" window
+        // in drawGUI(). Per-method Warp() dispatch lives in
+        // doVulkanMeshWarp().
+        enum class VulkanFillMethod : int {
+            Off = 0,      // holes stay black (honest baseline for A/B)
+            MipChain = 1, // blit mip-chain blurred local average
+        };
+        static constexpr int kVulkanFillCount = 2;
+        static const char* VulkanFillName(VulkanFillMethod m);
+        void CycleVulkanFill(int dir = 1);
+        float VulkanFillHoleRadius() const;
+        VulkanFillMethod vulkanFill = VulkanFillMethod::MipChain;
 
 #ifdef OPENWARP_HAS_VULKAN
         // Vulkan compute warp state (Option B). The GL scene still
@@ -150,11 +169,9 @@ class Openwarp::OpenwarpApplication{
         } vulkanStats;
         bool vulkanDepthLogged = false;
         uint64_t vulkanDumpCount = 0;
-        // Mip-chain hole fill: >0 enables (blurred local-average fill
-        // of disocclusions, constant cost/hole). 0 leaves them black.
-        float vulkanHoleFill = 1.0f;
-        // Background weight exponent for the fill (w = pow(depth, p)):
-        // higher p suppresses foreground smear into holes harder.
+        // Mip-chain hole fill tuning (only used when vulkanFill is a
+        // fill that averages neighbors; ignored by Off). Higher p
+        // suppresses foreground smear into holes harder (w=pow(depth,p));
         // 0 = uniform average. Runtime-tunable, tested at 0/1/2.
         float vulkanFillPower = 1.0f;
         double vulkanStatsLastLog = 0.0;
@@ -309,8 +326,14 @@ class Openwarp::OpenwarpApplication{
             if (key == GLFW_KEY_T && action == GLFW_PRESS) {
                 if(OpenwarpApplication::instance != NULL &&
                     !OpenwarpApplication::instance->imgui_io.WantCaptureMouse) {
-                    
-                    OpenwarpApplication::instance->useRay = !OpenwarpApplication::instance->useRay;
+                    if (OpenwarpApplication::instance->backend ==
+                        OpenwarpApplication::Backend::Vulkan) {
+                        // Vulkan mode: T cycles hole-fill methods (the
+                        // GL raymarch/mesh toggle is disconnected here).
+                        OpenwarpApplication::instance->CycleVulkanFill(1);
+                    } else {
+                        OpenwarpApplication::instance->useRay = !OpenwarpApplication::instance->useRay;
+                    }
                 }
             }
         }
