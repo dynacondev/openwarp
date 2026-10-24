@@ -3,16 +3,26 @@
  *
  * Part of the Openwarp project, NCSA licensed (see LICENSE).
  *
- * Patches pixels the pull pass left black with the local average from
- * the pull output's own mip chain. The pull output is premultiplied
- * (valid pixels (rgb, 1), holes (0,0,0,0)), so mip averages are
- * validity-weighted: dividing rgb by alpha yields the blurred mean of
- * valid neighbors only. Constant cost per hole pixel (<=3 taps) no
- * matter how wide the disocclusion is, and far cheaper than building a
- * compute pyramid (blits are fixed-function).
+ * Patches pixels the pull pass left black with a local average. The pull
+ * output is premultiplied (valid pixels (rgb*w, w), holes (0,0,0,0)),
+ * so averages are validity-weighted: dividing rgb by alpha yields the
+ * blurred mean of valid neighbors only.
  *
- * LOD choice (view-relative, view starts at image level 1): lod 2 is an
- * 8x8 footprint, lod 5 a 64x64 footprint, maxViewLod the whole frame.
+ * fillMode 0 (legacy): sample the pull output's own mip chain at
+ * widening LODs (constant cost/hole no matter how wide the
+ * disocclusion, far cheaper than a compute pyramid — blits are
+ * fixed-function). LOD choice (view-relative, view starts at image
+ * level 1): lod 2 is an 8x8 footprint, lod 5 a 64x64 footprint,
+ * maxViewLod the whole frame.
+ *
+ * fillMode 1 (depth-guided): first combine the finest stable mip taps
+ * (view lod 0 = image level 1, 2x2 footprints) over a 3x3 neighborhood,
+ * rejecting taps on the foreground side of the local background depth
+ * (deepest valid splat in the 5x5 full-res window). Falls back to the
+ * legacy mip taps when nothing local is valid (wide holes). Stays a
+ * safe blur but stops at depth edges instead of smearing the occluder
+ * across the gap, and keeps 1-2px cracks tight instead of blurring
+ * them with an 8x8 minimum footprint.
  */
 
 #version 450
@@ -26,10 +36,17 @@ layout(set = 0, binding = 2) uniform sampler2D dstMips;
 layout(push_constant) uniform Push
 {
 	int maxViewLod;
+	int fillMode; // 0 = legacy mip average, 1 = depth-guided local average + mip fallback
 } pc;
 
 #define SPLAT_EMPTY 0xffffffffu
 #define VALID_EPS (0.5 / 255.0)
+#define DEPTH_SCALE 16777215.0
+// Foreground rejection width for the guided average, in nonlinear 0..1
+// depth units: taps this much shallower than the local background fade
+// linearly to zero weight. Far-plane slopes vary slowly in nonlinear
+// space, so 0.02 keeps genuine background while killing the occluder.
+#define DEPTH_TOL 0.02
 
 void main()
 {
@@ -57,6 +74,55 @@ void main()
 	}
 
 	vec2 tuv = (vec2(xy) + vec2(0.5)) / vec2(size);
+
+	// Depth-guided local average (mode 1). The finest stable taps are
+	// view lod 0 (image level 1): level 0 is being written by this same
+	// dispatch, so it cannot be safely re-read for neighbors.
+	if (pc.fillMode == 1) {
+		// Background depth: deepest valid splat in the 5x5 full-res
+		// window (splatDepth is read-only in this pass: stable).
+		float bgDepth = -1.0;
+		for (int oy = -2; oy <= 2; oy++) {
+			for (int ox = -2; ox <= 2; ox++) {
+				ivec2 sxy = clamp(xy + ivec2(ox, oy), ivec2(0), size - ivec2(1));
+				uint e = imageLoad(splatDepth, sxy).x;
+				if (e != SPLAT_EMPTY)
+					bgDepth = max(bgDepth, float(e) / DEPTH_SCALE);
+			}
+		}
+		if (bgDepth >= 0.0) {
+			vec2 stepUV = 2.0 / vec2(size);
+			vec3 sumRgb = vec3(0.0);
+			float sumA = 0.0;
+			for (int oy = -1; oy <= 1; oy++) {
+				for (int ox = -1; ox <= 1; ox++) {
+					vec4 c = textureLod(dstMips, tuv + vec2(float(ox), float(oy)) * stepUV, 0.0);
+					if (c.a < VALID_EPS)
+						continue;
+					// Depth proxy: full-res splat at the tap center
+					// (each view-lod-0 tap spans 2x2 source pixels).
+					ivec2 sxy =
+					    clamp(xy + ivec2(ox * 2, oy * 2), ivec2(0), size - ivec2(1));
+					uint e = imageLoad(splatDepth, sxy).x;
+					if (e == SPLAT_EMPTY)
+						continue;
+					float tapDepth = float(e) / DEPTH_SCALE;
+					float dw = 1.0 - clamp((bgDepth - tapDepth) / DEPTH_TOL, 0.0, 1.0);
+					if (dw <= 0.0)
+						continue;
+					sumRgb += c.rgb * dw;
+					sumA += c.a * dw;
+				}
+			}
+			if (sumA >= VALID_EPS) {
+				imageStore(dstImg, xy, vec4(sumRgb / sumA, 1.0));
+				return;
+			}
+			// Nothing locally valid (wide hole): fall through to the
+			// mip fallback below.
+		}
+	}
+
 	int lodB = min(5, pc.maxViewLod);
 	vec4 c = textureLod(dstMips, tuv, 2.0);
 	if (c.a < VALID_EPS)

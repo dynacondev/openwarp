@@ -219,6 +219,52 @@ int main(int argc, char** argv)
 		ok = false;
 	}
 
+	// Test 5: depth-guided fill (mode 1). Same contract as the mip
+	// fill: holes vanish, valid pixels stay bit-exact vs the unfilled
+	// run (the valid normalize path is mode-independent).
+	warp.SetFillMode(1);
+	warp.SetFillWeightPow(1.0f);
+	{
+		std::vector<uint8_t> nofill, guided;
+		if (!warp.Warp(identity, proj, shifted, proj, 0.0f, nofill, false)) {
+			std::cerr << "guided nofill Warp() failed" << std::endl;
+			return 1;
+		}
+		if (!warp.Warp(identity, proj, shifted, proj, 1.0f, guided, false)) {
+			std::cerr << "guided Warp() failed" << std::endl;
+			return 1;
+		}
+		double guidedBlack = BlackFraction(guided);
+		std::cout << "[guided] blackFrac=" << guidedBlack << " (nofill black was "
+		          << BlackFraction(nofill) << ")" << std::endl;
+		if (!(guidedBlack < 0.15)) {
+			std::cerr << "FAIL: guided fill did not reduce black" << std::endl;
+			ok = false;
+		}
+		double validDiff = 0.0;
+		size_t validCount = 0;
+		for (size_t px = 0; px < kSize * kSize; px++) {
+			bool hole = (nofill[4 * px] == 0 && nofill[4 * px + 1] == 0 &&
+			             nofill[4 * px + 2] == 0);
+			if (!hole) {
+				for (int c = 0; c < 4; c++) {
+					validDiff += std::abs(static_cast<int>(nofill[4 * px + c]) -
+					                      static_cast<int>(guided[4 * px + c]));
+					validCount++;
+				}
+			}
+		}
+		validDiff /= validCount ? static_cast<double>(validCount) : 1.0;
+		std::cout << "[guided] valid-pixel meanAbsDiff=" << validDiff << std::endl;
+		if (!(validDiff < 1e-6)) {
+			std::cerr << "FAIL: guided fill altered valid pixels" << std::endl;
+			ok = false;
+		}
+		stbi_write_png((outDir + "/shifted_guided.png").c_str(), kSize, kSize, 4, guided.data(),
+		               kSize * 4);
+	}
+	warp.SetFillMode(0);
+
 	stbi_write_png((outDir + "/input.png").c_str(), kSize, kSize, 4, color.data(), kSize * 4);
 	stbi_write_png((outDir + "/identity.png").c_str(), kSize, kSize, 4, idOut.data(), kSize * 4);
 	stbi_write_png((outDir + "/shifted.png").c_str(), kSize, kSize, 4, shiftOut.data(),

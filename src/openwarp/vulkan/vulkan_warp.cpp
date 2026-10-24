@@ -861,7 +861,7 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 	if (!makePipe(pullSpv, s->pullLayout, s->pullPipeLayout, s->pullPipe, "pull pipeline"))
 		return false;
 	if (!makePipe(fillSpv, s->fillLayout, s->fillPipeLayout, s->fillPipe, "fill pipeline",
-	              sizeof(int32_t)))
+	              2 * sizeof(int32_t)))
 		return false;
 
 	// Timestamp queries: 0 submit-start, 1 after clear, 2 after splat,
@@ -1138,8 +1138,11 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 	                        &s->fillSet, 0, nullptr);
 	// View-relative LOD cap: view covers levels 1..N, so max lod is N-2.
 	int32_t maxViewLod = doFill ? static_cast<int32_t>(s->mipLevels) - 2 : -1;
+	int32_t fillMode = fillMode_;
 	vkCmdPushConstants(s->cmd, s->fillPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
 	                   sizeof(maxViewLod), &maxViewLod);
+	vkCmdPushConstants(s->cmd, s->fillPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+	                   sizeof(maxViewLod), sizeof(fillMode), &fillMode);
 	vkCmdDispatch(s->cmd, gx, gy, 1);
 	if (s->hasTimestamps)
 		vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 5);

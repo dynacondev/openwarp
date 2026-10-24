@@ -79,13 +79,21 @@ public:
 	// average. Tunable at runtime; takes effect on the next Warp().
 	void SetFillWeightPow(float p) { fillWeightPow_ = p; }
 
+	// Hole-fill variant for the fill pass (warp_fill.comp push
+	// constant): 0 = legacy mip-chain average, 1 = depth-guided local
+	// average with mip fallback. Takes effect on the next Warp().
+	// Out-of-range values fall back to 0 in-shader (unknown modes must
+	// never produce garbage).
+	void SetFillMode(int m) { fillMode_ = m; }
+
 	// Warp the uploaded frame from (srcPose, srcProj) to
 	// (dstPose, dstProj) and download the RGB8 result into outColor
-	// (width*height*4 bytes). holeRadius > 0 enables the mip-chain hole
-	// fill: the premultiplied pull output is blitted down the mip chain
-	// (fixed-function) and hole pixels sample the local average, i.e.
-	// the validity-weighted mean (blurred, never stretched). Constant
-	// cost per hole pixel; 0 leaves disocclusions black.
+	// (width*height*4 bytes). holeRadius > 0 enables hole filling
+	// (SetFillMode selects the variant: 0 legacy mip-chain average, 1
+	// depth-guided local average with mip fallback); 0 leaves
+	// disocclusions black. The pull output is premultiplied, so filled
+	// regions are the validity-weighted mean (blurred, never
+	// stretched). Constant cost per hole pixel.
 	// srcProj/dstProj are PerspectiveGL/FrustumGL matrices; near/far
 	// must match between the two (same convention as dynacon-vr).
 	// countCoverage also downloads the splat plane and counts filled
@@ -130,6 +138,7 @@ private:
 	uint32_t height_ = 0;
 	bool initialized_ = false;
 	float fillWeightPow_ = 1.0f;
+	int fillMode_ = 0;
 	float lastCoverage_ = -1.0f;
 	GpuTimes lastGpu_{};
 	std::vector<uint32_t> lastSplat_;
