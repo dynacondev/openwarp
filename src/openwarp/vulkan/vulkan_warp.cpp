@@ -1226,10 +1226,15 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 	// frame's valid pull pixels into the half-res BG on static frames;
 	// apply then projects cached texels into holes (stored straight
 	// with w = 1, so the fill normalize + every mode branch treat them
-	// as valid). Cost ~0.25x frame + one full-res pass; absorbed into
-	// the fillMs timestamp span (ts3..ts5).
-	const bool doBgUpdate = temporalCacheEnabled_ && isStatic;
-	const bool doBgApply = temporalCacheEnabled_ && bgValid_;
+	// as valid). Both passes are static-gated: the cache has no motion
+	// compensation (flat UV lookup), so projecting across camera motion
+	// would smear stale texels ("foreground left behind"). Static-only
+	// keeps the reprojection error subpixel; motion-compensated
+	// projection is follow-up work. Gated on doFill so Off stays
+	// honest black for A/B. Cost ~0.25x frame + one full-res pass;
+	// absorbed into the fillMs timestamp span (ts3..ts5).
+	const bool doBgUpdate = temporalCacheEnabled_ && isStatic && doFill;
+	const bool doBgApply = temporalCacheEnabled_ && bgValid_ && isStatic && doFill;
 	if (doBgUpdate || doBgApply) {
 		// BG images already GENERAL (Upload parks them there; they
 		// never leave). Order pull writes -> bg reads.

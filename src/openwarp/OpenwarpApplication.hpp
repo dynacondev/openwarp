@@ -140,6 +140,9 @@ class Openwarp::OpenwarpApplication{
         // demo stays usable where no Vulkan driver exists.
         std::unique_ptr<openwarp_vk::VulkanWarp> vulkanWarp;
         bool vulkanFailed = false;
+        // Mirrors Run(showGUI): the skip path re-presents the cached
+        // frame only when the GUI is up (headless holds instead).
+        bool guiEnabled = true;
         GLuint vulkanPresentTex = 0;
         GLint vulkanPresentProgram = 0;
         GLuint vulkanPresentVAO = 0;
@@ -151,12 +154,21 @@ class Openwarp::OpenwarpApplication{
         std::vector<float> vulkanDepth;
         std::vector<uint8_t> vulkanOut;
         // Dirty tracking: the source only changes when renderScene runs
-        // (15 Hz); re-warp only when the source or the target pose moved.
+        // (15 Hz); re-warp when the source, the target pose, or any fill
+        // setting moved. Fill settings MUST participate: otherwise
+        // switching method/power/radius/cache shows the stale image and
+        // every fill looks identical.
         uint64_t renderSeq = 0;
         uint64_t lastWarpRenderSeq = 0;
         bool haveLastWarpPose = false;
         Eigen::Vector3f lastWarpPos = Eigen::Vector3f::Zero();
         Eigen::Quaternionf lastWarpQuat = Eigen::Quaternionf::Identity();
+        // Last applied fill settings (sentinels force the first warp).
+        VulkanFillMethod lastWarpFill = VulkanFillMethod::Off;
+        float lastWarpFillPower = -1000.0f;
+        int lastWarpStretchRadius = -1;
+        bool lastWarpTemporalCache = false;
+        bool lastWarpFillInit = false;
         // Paced profiling: per-stage CPU ms + counts, logged every ~2 s.
         // gpu*Ms are device times from timestamp queries (when available);
         // the cpu gpu-warp number includes submit/wait + PCIe + memcpys.
@@ -195,6 +207,12 @@ class Openwarp::OpenwarpApplication{
         bool EnsureVulkanWarp();
         // 1 = presented, 0 = skipped identical frame, -1 = failed.
         int doVulkanMeshWarp();
+        // Redraws the last warped frame from the cached present texture
+        // (no re-upload, no re-warp). Used on the skip path so the ImGui
+        // fill window stays interactive while idle: same image redrawn
+        // into both buffers, so no stale-buffer ghosting. False when
+        // nothing has been warped yet.
+        bool presentCachedVulkanFrame();
         static double nowMs() { return glfwGetTime() * 1000.0; }
 #endif
 

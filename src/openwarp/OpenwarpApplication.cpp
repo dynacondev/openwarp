@@ -280,6 +280,9 @@ void OpenwarpApplication::RunTest(const TestRun& testRun, std::string runDir, bo
 }
 
 void OpenwarpApplication::Run(bool showGUI){
+#ifdef OPENWARP_HAS_VULKAN
+    guiEnabled = showGUI;
+#endif
     if (backend == Backend::Vulkan && !vulkanModeLogged) {
         vulkanModeLogged = true;
         std::cout << "[vulkan] backend active: GL scene render, mesh warp on Vulkan compute "
@@ -616,6 +619,39 @@ bool OpenwarpApplication::EnsureVulkanWarp()
     return true;
 }
 
+// Redraws the last warped frame from the cached present texture.
+// See the hpp for the ghosting rationale. False when nothing has been
+// warped yet (no texture/buffers exist).
+bool OpenwarpApplication::presentCachedVulkanFrame()
+{
+    if(vulkanPresentTex == 0 || vulkanPresentProgram == 0)
+        return false;
+    // Draw at the real framebuffer size (HiDPI/compositor scaling maps
+    // 1:1 only if the viewport matches; a hardcoded 1024 viewport on a
+    // 2x surface would upscale blurry / fill a quarter).
+    int fbW = WIDTH;
+    int fbH = HEIGHT;
+    glfwGetFramebufferSize(window, &fbW, &fbH);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, fbW, fbH);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glUseProgram(vulkanPresentProgram);
+    if(vulkanPresentTexLoc == -2)
+        vulkanPresentTexLoc = glGetUniformLocation(vulkanPresentProgram, "present_tex");
+    if(vulkanPresentTexLoc >= 0) {
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, vulkanPresentTex);
+        glUniform1i(vulkanPresentTexLoc, 0);
+    }
+    glBindVertexArray(vulkanPresentVAO);
+    // (VAO holds the fullscreen-quad attrib setup from creation; no
+    // per-warp vertex setup needed.)
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glBindVertexArray(0);
+    return true;
+}
+
 // Returns 1 when a frame was presented, 0 when the frame was
 // skipped as identical (nothing painted: hold the last frame), -1
 // when Vulkan is unavailable/failed (caller falls back to GL).
@@ -625,14 +661,26 @@ int OpenwarpApplication::doVulkanMeshWarp()
         return -1;
 
     // Dirty tracking: the source frame only changes when renderScene runs
-    // (15 Hz). Re-upload then; re-warp only when the source or the target
-    // pose moved since the last warp. Otherwise the previously presented
-    // frame is still correct — skip everything (this is what keeps an
-    // uncapped present loop from re-warping identical frames at 1000 Hz).
+    // (15 Hz). Re-upload then; re-warp when the source, the target pose,
+    // or any fill setting moved since the last warp. Fill settings MUST
+    // participate: otherwise switching method/power/radius/cache shows
+    // the stale image and every fill looks identical. Otherwise the
+    // previously presented frame is still correct — skip everything
+    // (this is what keeps an uncapped present loop from re-warping
+    // identical frames at 1000 Hz).
     bool poseMoved = !haveLastWarpPose || lastWarpPos != position || lastWarpQuat != orientation;
     bool freshSource = (renderSeq != lastWarpRenderSeq);
-    if(!poseMoved && !freshSource) {
+    bool fillChanged = !lastWarpFillInit || vulkanFill != lastWarpFill ||
+        vulkanFillPower != lastWarpFillPower || vulkanStretchRadius != lastWarpStretchRadius ||
+        vulkanTemporalCache != lastWarpTemporalCache;
+    if(!poseMoved && !freshSource && !fillChanged) {
         vulkanStats.skips++;
+        // Idle with nothing new: re-present the cached frame when the
+        // GUI is up so the fill window stays interactive (same texture
+        // redrawn into the back buffer — no stale-buffer ghosting, and
+        // no 4 MiB re-upload). Headless holds the last frame instead.
+        if(guiEnabled && presentCachedVulkanFrame())
+            return 1;
         return 0;
     }
 
@@ -729,6 +777,11 @@ int OpenwarpApplication::doVulkanMeshWarp()
     haveLastWarpPose = true;
     lastWarpPos = position;
     lastWarpQuat = orientation;
+    lastWarpFill = vulkanFill;
+    lastWarpFillPower = vulkanFillPower;
+    lastWarpStretchRadius = vulkanStretchRadius;
+    lastWarpTemporalCache = vulkanTemporalCache;
+    lastWarpFillInit = true;
     if(wantCoverage)
         vulkanStats.lastCoverage = vulkanWarp->LastCoverage();
     {
@@ -810,29 +863,9 @@ int OpenwarpApplication::doVulkanMeshWarp()
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, WIDTH, HEIGHT, GL_RGBA, GL_UNSIGNED_BYTE,
                      vulkanOut.data());
 
-    // Draw at the real framebuffer size (HiDPI/compositor scaling maps
-    // 1:1 only if the viewport matches; a hardcoded 1024 viewport on a
-    // 2x surface would upscale blurry / fill a quarter).
-    int fbW = WIDTH;
-    int fbH = HEIGHT;
-    glfwGetFramebufferSize(window, &fbW, &fbH);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, fbW, fbH);
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_CULL_FACE);
-    glUseProgram(vulkanPresentProgram);
-    if(vulkanPresentTexLoc == -2)
-        vulkanPresentTexLoc = glGetUniformLocation(vulkanPresentProgram, "present_tex");
-    if(vulkanPresentTexLoc >= 0) {
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, vulkanPresentTex);
-        glUniform1i(vulkanPresentTexLoc, 0);
-    }
-    glBindVertexArray(vulkanPresentVAO);
-    // (VAO holds the fullscreen-quad attrib setup from creation; no
-    // per-warp vertex setup needed.)
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    glBindVertexArray(0);
+    // Draw the freshly uploaded frame (shared with the idle skip path:
+    // same texture redrawn, so no stale-buffer ghosting).
+    presentCachedVulkanFrame();
     double tPresent = nowMs();
 
     vulkanStats.readbackMs += (tReadback - t0);
