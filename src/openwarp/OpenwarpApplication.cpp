@@ -263,10 +263,19 @@ void OpenwarpApplication::Run(bool showGUI){
         // we render, and schedule the next one from completion: with warps
         // slower than the render interval, absolute scheduling would lag
         // forever and render every iteration catching up (judder).
+        // painted tracks whether the back buffer holds anything new this
+        // frame. Swapping with no new paint alternates the two stale
+        // buffers on screen (ghosting/double image at uncapped rates),
+        // so idle frames hold the last presented frame instead.
+        bool painted = false;
         if(glfwGetTime() >= nextRenderTime){
 
             if(shouldRenderScene) {
                 renderScene();
+                // Direct-to-screen renders paint the screen; renderFBO
+                // renders do not (only the warp presents those).
+                if (!shouldReproject)
+                    painted = true;
             }
 
             nextRenderTime = glfwGetTime() + renderInterval;
@@ -280,17 +289,19 @@ void OpenwarpApplication::Run(bool showGUI){
         // you would resample user pose every time before reprojection
         // for the most up-to-date pose.
         if (shouldReproject)
-            doReprojection(useRay);
+            painted = doReprojection(useRay) || painted;
 
-        if(showGUI)
-            drawGUI();
-        
-        glfwSwapBuffers(window);
-        // EMA so the overlay doesn't swing wildly with variable warp time.
-        double instFps = 1.0 / (glfwGetTime() - lastSwapTime);
-        presentationFramerate =
-            (presentationFramerate <= 0.0) ? instFps : (0.95 * presentationFramerate + 0.05 * instFps);
-        lastSwapTime = glfwGetTime();
+        if (painted) {
+            if(showGUI)
+                drawGUI();
+
+            glfwSwapBuffers(window);
+            // EMA so the overlay doesn't swing wildly with variable warp time.
+            double instFps = 1.0 / (glfwGetTime() - lastSwapTime);
+            presentationFramerate =
+                (presentationFramerate <= 0.0) ? instFps : (0.95 * presentationFramerate + 0.05 * instFps);
+            lastSwapTime = glfwGetTime();
+        }
     }
 }
 
@@ -566,10 +577,13 @@ bool OpenwarpApplication::EnsureVulkanWarp()
     return true;
 }
 
-bool OpenwarpApplication::doVulkanMeshWarp()
+// Returns 1 when a frame was presented, 0 when the frame was
+// skipped as identical (nothing painted: hold the last frame), -1
+// when Vulkan is unavailable/failed (caller falls back to GL).
+int OpenwarpApplication::doVulkanMeshWarp()
 {
     if(!EnsureVulkanWarp())
-        return false;
+        return -1;
 
     // Dirty tracking: the source frame only changes when renderScene runs
     // (15 Hz). Re-upload then; re-warp only when the source or the target
@@ -580,7 +594,7 @@ bool OpenwarpApplication::doVulkanMeshWarp()
     bool freshSource = (renderSeq != lastWarpRenderSeq);
     if(!poseMoved && !freshSource) {
         vulkanStats.skips++;
-        return true;
+        return 0;
     }
 
     double t0 = nowMs();
@@ -610,7 +624,7 @@ bool OpenwarpApplication::doVulkanMeshWarp()
             std::cerr << "[vulkan] Upload failed (" << vulkanWarp->LastError() << "); disabling."
                       << std::endl;
             vulkanFailed = true;
-            return false;
+            return -1;
         }
         vulkanStats.uploads++;
         lastWarpRenderSeq = renderSeq;
@@ -669,7 +683,7 @@ bool OpenwarpApplication::doVulkanMeshWarp()
         std::cerr << "[vulkan] Warp failed (" << vulkanWarp->LastError() << "); disabling."
                   << std::endl;
         vulkanFailed = true;
-        return false;
+        return -1;
     }
     vulkanStats.warps++;
     haveLastWarpPose = true;
@@ -816,19 +830,23 @@ bool OpenwarpApplication::doVulkanMeshWarp()
             vulkanStats.gpuCopyMs = 0.0;
         vulkanStats.gpuTimedWarps = 0;
     }
-    return true;
+    return 1;
 }
 #endif // OPENWARP_HAS_VULKAN
 
-void OpenwarpApplication::doReprojection(bool useRay){
+// Returns true when anything new was painted to the back buffer.
+bool OpenwarpApplication::doReprojection(bool useRay){
 
     if(backend == Backend::Vulkan) {
         // Raymarch is GL-only; never raymarch under --vulkan.
         useRay = false;
 #ifdef OPENWARP_HAS_VULKAN
         // The Vulkan compute warp IS the mesh warp in this mode.
-        if(doVulkanMeshWarp())
-            return;
+        // 1 = presented, 0 = skipped identical frame (hold the last
+        // one), -1 = fall through to the GL mesh path below.
+        int vulkanResult = doVulkanMeshWarp();
+        if(vulkanResult >= 0)
+            return vulkanResult > 0;
         // Fell through: Vulkan unavailable/failed, use the GL mesh path
         // so the demo stays alive and frame-comparable.
         if(!vulkanModeLogged) {
@@ -891,7 +909,12 @@ void OpenwarpApplication::doReprojection(bool useRay){
     // lens undistort shader, we'd create another FBO and render to that.
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-    glViewport(0,0,WIDTH,HEIGHT);
+    // Full framebuffer (not WIDTHxHEIGHT): on HiDPI the surface is
+    // larger and a small viewport would leave a stale rim of the last
+    // reprojected frame on screen.
+    int glW = WIDTH, glH = HEIGHT;
+    glfwGetFramebufferSize(window, &glW, &glH);
+    glViewport(0, 0, glW, glH);
     glDisable(GL_CULL_FACE);
     glDepthFunc(GL_LEQUAL);
     glEnable(GL_DEPTH_TEST);
@@ -913,7 +936,7 @@ void OpenwarpApplication::doReprojection(bool useRay){
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, useRay ? rayProgram.mesh_indices_vbo : meshProgram.mesh_indices_vbo);
     glDrawElements(GL_TRIANGLES, useRay ? rayProgram.mesh_indices.size() : meshProgram.mesh_indices.size(), GL_UNSIGNED_INT, NULL);
 
-    
+    return true;
 }
 
 void OpenwarpApplication::renderScene(){
@@ -925,13 +948,18 @@ void OpenwarpApplication::renderScene(){
     renderSeq++;
 #endif
 
-    // If reprojection is disabled, we render straight to the screen.
-    if (shouldReproject)
+    // If reprojection is disabled, we render straight to the screen
+    // (full framebuffer: a WIDTHxHEIGHT viewport on a larger HiDPI
+    // surface would leave a stale rim of the last reprojected frame).
+    if (shouldReproject) {
         glBindFramebuffer(GL_FRAMEBUFFER, renderFBO);
-    else
+        glViewport(0, 0, WIDTH, HEIGHT);
+    } else {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    
-    glViewport(0, 0, WIDTH, HEIGHT);
+        int fbW = WIDTH, fbH = HEIGHT;
+        glfwGetFramebufferSize(window, &fbW, &fbH);
+        glViewport(0, 0, fbW, fbH);
+    }
     glEnable(GL_CULL_FACE);
     glDepthFunc(GL_LEQUAL);
     glEnable(GL_DEPTH_TEST);

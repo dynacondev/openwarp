@@ -183,7 +183,8 @@ class Openwarp::OpenwarpApplication{
         int vulkanStretchRadius = 4;
         double vulkanStatsLastLog = 0.0;
         bool EnsureVulkanWarp();
-        bool doVulkanMeshWarp();
+        // 1 = presented, 0 = skipped identical frame, -1 = failed.
+        int doVulkanMeshWarp();
         static double nowMs() { return glfwGetTime() * 1000.0; }
 #endif
 
@@ -276,7 +277,8 @@ class Openwarp::OpenwarpApplication{
         void drawGUI();
         void processInput();
         void renderScene();
-        void doReprojection(bool useRay);
+        // True when anything new was painted to the back buffer.
+        bool doReprojection(bool useRay);
 
         static void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
             OpenwarpApplication::instance->renderFPS += yoffset;
