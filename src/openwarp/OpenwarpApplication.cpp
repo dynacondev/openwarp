@@ -31,17 +31,48 @@ const char* OpenwarpApplication::VulkanFillName(VulkanFillMethod m)
     case VulkanFillMethod::MipChain: return "Mip-chain blur";
     case VulkanFillMethod::DepthGuided: return "Depth-guided blur";
     case VulkanFillMethod::Stretch: return "Background stretch";
+    case VulkanFillMethod::DirectionalMarch: return "Directional march";
+    case VulkanFillMethod::BgExtrapolate: return "BG extrapolate";
+    case VulkanFillMethod::BilateralGather: return "Bilateral gather";
     default: return "<unknown>";
+    }
+}
+
+OpenwarpApplication::VulkanFillMethod OpenwarpApplication::VulkanFillByIndex(int i)
+{
+    switch (i) {
+    case 0: return VulkanFillMethod::Off;
+    case 1: return VulkanFillMethod::MipChain;
+    case 2: return VulkanFillMethod::DepthGuided;
+    case 3: return VulkanFillMethod::Stretch;
+    case 4: return VulkanFillMethod::DirectionalMarch;
+    case 5: return VulkanFillMethod::BgExtrapolate;
+    case 6: return VulkanFillMethod::BilateralGather;
+    default: return VulkanFillMethod::Off;
+    }
+}
+
+int OpenwarpApplication::VulkanFillIndex(VulkanFillMethod m)
+{
+    switch (m) {
+    case VulkanFillMethod::Off: return 0;
+    case VulkanFillMethod::MipChain: return 1;
+    case VulkanFillMethod::DepthGuided: return 2;
+    case VulkanFillMethod::Stretch: return 3;
+    case VulkanFillMethod::DirectionalMarch: return 4;
+    case VulkanFillMethod::BgExtrapolate: return 5;
+    case VulkanFillMethod::BilateralGather: return 6;
+    default: return 0;
     }
 }
 
 void OpenwarpApplication::CycleVulkanFill(int dir)
 {
-    int v = static_cast<int>(vulkanFill) + dir;
-    v %= kVulkanFillCount;
-    if (v < 0)
-        v += kVulkanFillCount;
-    vulkanFill = static_cast<VulkanFillMethod>(v);
+    int i = VulkanFillIndex(vulkanFill) + dir;
+    i %= kVulkanFillCount;
+    if (i < 0)
+        i += kVulkanFillCount;
+    vulkanFill = VulkanFillByIndex(i);
 }
 
 float OpenwarpApplication::VulkanFillHoleRadius() const
@@ -53,8 +84,11 @@ float OpenwarpApplication::VulkanFillHoleRadius() const
     switch (vulkanFill) {
     case VulkanFillMethod::Off: return 0.0f;
     case VulkanFillMethod::MipChain: return 1.0f;
-    // Stretch also needs the chain (its blur fallback).
+    case VulkanFillMethod::DepthGuided: return 1.0f;
     case VulkanFillMethod::Stretch: return 1.0f;
+    case VulkanFillMethod::DirectionalMarch: return 1.0f;
+    case VulkanFillMethod::BgExtrapolate: return 1.0f;
+    case VulkanFillMethod::BilateralGather: return 1.0f;
     default: return 0.0f;
     }
 }
@@ -63,9 +97,10 @@ int OpenwarpApplication::VulkanFillMode() const
 {
     // Maps onto the warp_fill.comp fillMode push constant.
     switch (vulkanFill) {
-    // Stretch pairs with the legacy mip fallback (guided+stretch
-    // combo is future work).
     case VulkanFillMethod::DepthGuided: return 1;
+    case VulkanFillMethod::DirectionalMarch: return 2;
+    case VulkanFillMethod::BgExtrapolate: return 3;
+    case VulkanFillMethod::BilateralGather: return 4;
     case VulkanFillMethod::Off:
     case VulkanFillMethod::MipChain:
     case VulkanFillMethod::Stretch:
@@ -342,7 +377,7 @@ void OpenwarpApplication::drawGUI(){
         ImGui::Begin("Vulkan fill", &showVulkanFillConfig, ImGuiWindowFlags_NoResize);
         ImGui::Text("Fill method (T cycles)");
         for (int i = 0; i < kVulkanFillCount; i++) {
-            auto m = static_cast<VulkanFillMethod>(i);
+            auto m = VulkanFillByIndex(i);
             bool active = (vulkanFill == m);
             if (ImGui::RadioButton(VulkanFillName(m), active))
                 vulkanFill = m;
@@ -362,6 +397,10 @@ void OpenwarpApplication::drawGUI(){
             ImGui::SliderInt("##vkstretch", &vulkanStretchRadius, 1, 8);
             ImGui::PopItemWidth();
         }
+        // Orthogonal to the method above: cached background texels are
+        // projected into holes before the fill pass, so they sit
+        // underneath Off/MipChain/DepthGuided/Stretch alike.
+        ImGui::Checkbox("Temporal BG cache (underneath)", &vulkanTemporalCache);
         if (vulkanFill == VulkanFillMethod::Off) {
             ImGui::TextWrapped("Fill has no tunable parameters.");
         }
@@ -678,6 +717,7 @@ int OpenwarpApplication::doVulkanMeshWarp()
     vulkanWarp->SetFillWeightPow(vulkanFillPower);
     vulkanWarp->SetFillMode(VulkanFillMode());
     vulkanWarp->SetStretchRadius(vulkanFill == VulkanFillMethod::Stretch ? vulkanStretchRadius : 0);
+    vulkanWarp->SetTemporalCacheEnabled(vulkanTemporalCache);
     if(!vulkanWarp->Warp(srcPose, srcProj, dstPose, dstProj, VulkanFillHoleRadius(), vulkanOut,
                          wantCoverage)) {
         std::cerr << "[vulkan] Warp failed (" << vulkanWarp->LastError() << "); disabling."

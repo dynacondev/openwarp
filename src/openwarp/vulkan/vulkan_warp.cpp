@@ -134,11 +134,16 @@ struct VulkanWarp::State {
 		// Per-level layouts (the warp target carries a mip chain whose
 		// levels diverge during blits). Mirrors layout for 1-level imgs.
 		std::vector<VkImageLayout> levels;
-	} srcColor, srcDepth, splat, dst;
+	} srcColor, srcDepth, splat, dst, bgColor, bgDepth;
 
 	// Sampled view of dst mip levels 1..N for the fill pass.
 	VkImageView dstMipView = VK_NULL_HANDLE;
 	uint32_t mipLevels = 1;
+
+	// Persistent half-res BG layer (temporal cache): bgColor RGBA8 +
+	// bgDepth R32F (negative = invalid, host-cleared on Upload).
+	uint32_t bgW = 0;
+	uint32_t bgH = 0;
 
 	struct Buffer {
 		VkBuffer handle = VK_NULL_HANDLE;
@@ -152,16 +157,20 @@ struct VulkanWarp::State {
 	VkDescriptorSetLayout splatLayout = VK_NULL_HANDLE;
 	VkDescriptorSetLayout pullLayout = VK_NULL_HANDLE;
 	VkDescriptorSetLayout fillLayout = VK_NULL_HANDLE;
+	VkDescriptorSetLayout bgLayout = VK_NULL_HANDLE;
 	VkDescriptorPool descPool = VK_NULL_HANDLE;
 	VkDescriptorSet splatSet = VK_NULL_HANDLE;
 	VkDescriptorSet pullSet = VK_NULL_HANDLE;
 	VkDescriptorSet fillSet = VK_NULL_HANDLE;
+	VkDescriptorSet bgSet = VK_NULL_HANDLE;
 	VkPipelineLayout splatPipeLayout = VK_NULL_HANDLE;
 	VkPipelineLayout pullPipeLayout = VK_NULL_HANDLE;
 	VkPipelineLayout fillPipeLayout = VK_NULL_HANDLE;
+	VkPipelineLayout bgPipeLayout = VK_NULL_HANDLE;
 	VkPipeline splatPipe = VK_NULL_HANDLE;
 	VkPipeline pullPipe = VK_NULL_HANDLE;
 	VkPipeline fillPipe = VK_NULL_HANDLE;
+	VkPipeline bgPipe = VK_NULL_HANDLE;
 
 	// Optional GPU timestamp queries (stage timing). Created when the
 	// queue family supports them; all use is guarded by hasTimestamps.
@@ -557,8 +566,9 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 		       VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)))
 			return Fail(error, "R8G8B8A8_UNORM lacks sampled+storage+blit+linear-filter support");
 		vkGetPhysicalDeviceFormatProperties(s->phys, VK_FORMAT_R32_SFLOAT, &fp);
-		if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))
-			return Fail(error, "R32_SFLOAT lacks sampled support");
+		if (!(fp.optimalTilingFeatures & (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+		                                  VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)))
+			return Fail(error, "R32_SFLOAT lacks sampled+storage support");
 		vkGetPhysicalDeviceFormatProperties(s->phys, VK_FORMAT_R32_UINT, &fp);
 		if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))
 			return Fail(error, "R32_UINT lacks storage support");
@@ -635,6 +645,21 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 		           error))
 			return false;
 	}
+
+	// Persistent half-res BG layer (temporal cache): color + depth.
+	// Storage-only (the bg pass uses imageLoad/Store, no sampler);
+	// TRANSFER_DST so Upload() can clear/invalidate. Quarter pixels
+	// => ~0.25x the frame cost for update + 2 MiB at 1024x1024.
+	s->bgW = std::max(1u, width / 2);
+	s->bgH = std::max(1u, height / 2);
+	if (!CreateImage(s, s->bgW, s->bgH, VK_FORMAT_R8G8B8A8_UNORM,
+	                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, s->bgColor,
+	                 error))
+		return false;
+	if (!CreateImage(s, s->bgW, s->bgH, VK_FORMAT_R32_SFLOAT,
+	                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, s->bgDepth,
+	                 error))
+		return false;
 
 	// Buffers: UBOs + one staging buffer. Staging holds TWO planes
 	// (color at +0, depth at +planeBytes): both upload copies are
@@ -749,16 +774,33 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 	           error))
 		return false;
 
+	// Temporal cache layout: dst + splat + the two persistent half-res
+	// BG images (all storage). Own set/layout on purpose: the fill
+	// set/push layout stays untouched (shared with fill-mode work), so
+	// the cache cannot collide with it.
+	VkDescriptorSetLayoutBinding bgBindings[4]{};
+	for (uint32_t i = 0; i < 4; i++) {
+		bgBindings[i].binding = i;
+		bgBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+		bgBindings[i].descriptorCount = 1;
+		bgBindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	}
+	li.bindingCount = 4;
+	li.pBindings = bgBindings;
+	if (!Check(vkCreateDescriptorSetLayout(s->device, &li, nullptr, &s->bgLayout), "bg layout",
+	           error))
+		return false;
+
 	VkDescriptorPoolSize poolSizes[3]{};
 	poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 	poolSizes[0].descriptorCount = 3; // splat, pull, fill
 	poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 	poolSizes[1].descriptorCount = 2;
 	poolSizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-	poolSizes[2].descriptorCount = 5; // splat, pull x2, fill x2
+	poolSizes[2].descriptorCount = 9; // splat, pull x2, fill x2, bg x4
 	VkDescriptorPoolCreateInfo dpi{};
 	dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-	dpi.maxSets = 3;
+	dpi.maxSets = 4;
 	dpi.poolSizeCount = 3;
 	dpi.pPoolSizes = poolSizes;
 	if (!Check(vkCreateDescriptorPool(s->device, &dpi, nullptr, &s->descPool), "desc pool", error))
@@ -775,6 +817,9 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 		return false;
 	alloc.pSetLayouts = &s->fillLayout;
 	if (!Check(vkAllocateDescriptorSets(s->device, &alloc, &s->fillSet), "alloc fill set", error))
+		return false;
+	alloc.pSetLayouts = &s->bgLayout;
+	if (!Check(vkAllocateDescriptorSets(s->device, &alloc, &s->bgSet), "alloc bg set", error))
 		return false;
 
 	auto writeCombined = [&](VkDescriptorSet set, uint32_t binding, VkSampler sampler,
@@ -830,16 +875,21 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 	writeStorage(s->fillSet, 1, s->splat.view);
 	writeCombined(s->fillSet, 2, s->colorSampler, s->dstMipView,
 	              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+	writeStorage(s->bgSet, 0, s->dst.view);
+	writeStorage(s->bgSet, 1, s->splat.view);
+	writeStorage(s->bgSet, 2, s->bgColor.view);
+	writeStorage(s->bgSet, 3, s->bgDepth.view);
 
 	// Pipelines.
-	std::vector<uint32_t> splatSpv, pullSpv, fillSpv;
+	std::vector<uint32_t> splatSpv, pullSpv, fillSpv, bgSpv;
 	if (!LoadSpv(spvDir + "/warp_splat.spv", splatSpv, error) ||
 	    !LoadSpv(spvDir + "/warp_pull.spv", pullSpv, error) ||
-	    !LoadSpv(spvDir + "/warp_fill.spv", fillSpv, error))
+	    !LoadSpv(spvDir + "/warp_fill.spv", fillSpv, error) ||
+	    !LoadSpv(spvDir + "/warp_bg_update.spv", bgSpv, error))
 		return false;
 	std::cout << "[vulkan] SPIR-V: warp_splat.spv " << splatSpv.size() * 4 << " bytes, warp_pull.spv "
-	          << pullSpv.size() * 4 << " bytes, warp_fill.spv " << fillSpv.size() * 4 << " bytes"
-	          << std::endl;
+	          << pullSpv.size() * 4 << " bytes, warp_fill.spv " << fillSpv.size() * 4
+	          << " bytes, warp_bg_update.spv " << bgSpv.size() * 4 << " bytes" << std::endl;
 	auto makePipe = [&](const std::vector<uint32_t>& spv, VkDescriptorSetLayout layout,
 	                    VkPipelineLayout& pipeLayout, VkPipeline& pipe, const char* what,
 	                    uint32_t pushSize = 0) {
@@ -877,7 +927,10 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 	if (!makePipe(pullSpv, s->pullLayout, s->pullPipeLayout, s->pullPipe, "pull pipeline"))
 		return false;
 	if (!makePipe(fillSpv, s->fillLayout, s->fillPipeLayout, s->fillPipe, "fill pipeline",
-	              2 * sizeof(int32_t)))
+	              3 * sizeof(int32_t))) // int maxViewLod, int fillMode, float weightPow
+		return false;
+	if (!makePipe(bgSpv, s->bgLayout, s->bgPipeLayout, s->bgPipe, "bg pipeline",
+	              sizeof(int32_t)))
 		return false;
 
 	// Timestamp queries: 0 submit-start, 1 after clear, 2 after splat,
@@ -930,12 +983,16 @@ void VulkanWarp::Shutdown()
 			vkDestroyPipeline(s->device, s->pullPipe, nullptr);
 		if (s->fillPipe)
 			vkDestroyPipeline(s->device, s->fillPipe, nullptr);
+		if (s->bgPipe)
+			vkDestroyPipeline(s->device, s->bgPipe, nullptr);
 		if (s->splatPipeLayout)
 			vkDestroyPipelineLayout(s->device, s->splatPipeLayout, nullptr);
 		if (s->pullPipeLayout)
 			vkDestroyPipelineLayout(s->device, s->pullPipeLayout, nullptr);
 		if (s->fillPipeLayout)
 			vkDestroyPipelineLayout(s->device, s->fillPipeLayout, nullptr);
+		if (s->bgPipeLayout)
+			vkDestroyPipelineLayout(s->device, s->bgPipeLayout, nullptr);
 		if (s->descPool)
 			vkDestroyDescriptorPool(s->device, s->descPool, nullptr);
 		if (s->splatLayout)
@@ -944,6 +1001,8 @@ void VulkanWarp::Shutdown()
 			vkDestroyDescriptorSetLayout(s->device, s->pullLayout, nullptr);
 		if (s->fillLayout)
 			vkDestroyDescriptorSetLayout(s->device, s->fillLayout, nullptr);
+		if (s->bgLayout)
+			vkDestroyDescriptorSetLayout(s->device, s->bgLayout, nullptr);
 		if (s->colorSampler)
 			vkDestroySampler(s->device, s->colorSampler, nullptr);
 		if (s->depthSampler)
@@ -971,6 +1030,8 @@ void VulkanWarp::Shutdown()
 		freeImg(s->srcDepth);
 		freeImg(s->splat);
 		freeImg(s->dst);
+		freeImg(s->bgColor);
+		freeImg(s->bgDepth);
 		if (s->dstMipView)
 			vkDestroyImageView(s->device, s->dstMipView, nullptr);
 		if (s->fence)
@@ -1014,6 +1075,30 @@ bool VulkanWarp::Upload(const uint8_t* colorRGBA, const float* depth)
 	};
 	uploadPlane(s->srcColor, colorRGBA, colorBytes, 0);
 	uploadPlane(s->srcDepth, depth, depthBytes, planeBytes);
+	// A new source frame invalidates the persistent BG cache (stale
+	// texels would ghost). Clear + park in GENERAL; the next static
+	// Warp() re-primes (bgValid_ gates projection until then).
+	{
+		VkImageSubresourceRange bgRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		Transition(s, s->bgColor, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		           VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+		VkClearColorValue bgClear{};
+		vkCmdClearColorImage(s->cmd, s->bgColor.handle,
+		                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &bgClear, 1, &bgRange);
+		Transition(s, s->bgColor, VK_IMAGE_LAYOUT_GENERAL,
+		           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+		           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+		Transition(s, s->bgDepth, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		           VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+		VkClearColorValue bgDepthClear{};
+		bgDepthClear.float32[0] = -1.0f; // BG_INVALID: no cached depth
+		vkCmdClearColorImage(s->cmd, s->bgDepth.handle,
+		                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &bgDepthClear, 1, &bgRange);
+		Transition(s, s->bgDepth, VK_IMAGE_LAYOUT_GENERAL,
+		           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+		           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+	}
+	bgValid_ = false;
 	if (!SubmitWait(s, &lastError_)) {
 		if (lastError_.empty())
 			lastError_ = "Upload: submit/wait failed";
@@ -1050,7 +1135,35 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 	Multiply(srcProj, viewSrc, pullUbo.srcVP);
 	pullUbo.tune[0] = fillWeightPow_;
 	pullUbo.tune[1] = static_cast<float>(stretchRadius_);
-	pullUbo.tune[2] = pullUbo.tune[3] = 0.0f;
+	// Temporal cache signaling on the reserved tune channels (the pull
+	// shader ignores z/w; the bg pass itself is host-gated — these only
+	// document the frame state for follow-ups):
+	//  z = cache enabled, w = static (intra-warp src/dst gate below).
+	float tdx = dstPose.pos[0] - srcPose.pos[0];
+	float tdy = dstPose.pos[1] - srcPose.pos[1];
+	float tdz = dstPose.pos[2] - srcPose.pos[2];
+	float tdist =
+	    std::sqrt(tdx * tdx + tdy * tdy + tdz * tdz);
+	float qd = std::fabs(srcPose.quat[0] * dstPose.quat[0] + srcPose.quat[1] * dstPose.quat[1] +
+	                     srcPose.quat[2] * dstPose.quat[2] + srcPose.quat[3] * dstPose.quat[3]);
+	qd = std::min(qd, 1.0f);
+	float ang = 2.0f * std::acos(qd);
+	const bool isStatic = tdist < 0.002f && ang < 0.00523599f; // 2mm / 0.3deg
+	if (havePrevPose_) {
+		// World-space linear velocity stub ((P0-P1)*alpha, alpha = 1):
+		// placeholder for motion-compensated projection. Full
+		// per-pixel GFFE history is follow-up work.
+		for (int i = 0; i < 3; i++)
+			lastVel_[i] = (dstPose.pos[i] - prevDstPose_.pos[i]) * 1.0f;
+	} else {
+		lastVel_[0] = lastVel_[1] = lastVel_[2] = 0.0f;
+	}
+	lastStatic_ = isStatic;
+	prevSrcPose_ = srcPose;
+	prevDstPose_ = dstPose;
+	havePrevPose_ = true;
+	pullUbo.tune[2] = temporalCacheEnabled_ ? 1.0f : 0.0f;
+	pullUbo.tune[3] = isStatic ? 1.0f : 0.0f;
 	std::memcpy(s->uboSplat.mapped, &splatUbo, sizeof(splatUbo));
 	std::memcpy(s->uboPull.mapped, &pullUbo, sizeof(pullUbo));
 
@@ -1108,6 +1221,48 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 	if (s->hasTimestamps)
 		vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 3);
 
+	// Temporal BG cache (host-gated; the fill pass is untouched so the
+	// cache sits underneath every fillMode). Update ingests this
+	// frame's valid pull pixels into the half-res BG on static frames;
+	// apply then projects cached texels into holes (stored straight
+	// with w = 1, so the fill normalize + every mode branch treat them
+	// as valid). Cost ~0.25x frame + one full-res pass; absorbed into
+	// the fillMs timestamp span (ts3..ts5).
+	const bool doBgUpdate = temporalCacheEnabled_ && isStatic;
+	const bool doBgApply = temporalCacheEnabled_ && bgValid_;
+	if (doBgUpdate || doBgApply) {
+		// BG images already GENERAL (Upload parks them there; they
+		// never leave). Order pull writes -> bg reads.
+		VkMemoryBarrier bgBar{};
+		bgBar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+		bgBar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+		bgBar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		auto bgBarrier = [&]() {
+			vkCmdPipelineBarrier(s->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &bgBar, 0, nullptr,
+			                     0, nullptr);
+		};
+		bgBarrier();
+		vkCmdBindPipeline(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s->bgPipe);
+		vkCmdBindDescriptorSets(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s->bgPipeLayout, 0, 1,
+		                        &s->bgSet, 0, nullptr);
+		if (doBgUpdate) {
+			int32_t bgMode = 1; // update
+			vkCmdPushConstants(s->cmd, s->bgPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+			                   sizeof(bgMode), &bgMode);
+			vkCmdDispatch(s->cmd, (s->bgW + 7) / 8, (s->bgH + 7) / 8, 1);
+			bgBarrier(); // update BG writes -> apply BG reads
+			bgValid_ = true;
+		}
+		if (doBgApply) {
+			int32_t bgMode = 0; // project/apply
+			vkCmdPushConstants(s->cmd, s->bgPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+			                   sizeof(bgMode), &bgMode);
+			vkCmdDispatch(s->cmd, gx, gy, 1);
+			bgBarrier(); // apply dst writes -> blit/fill dst reads
+		}
+	}
+
 	if (doFill) {
 		// Mip-chain hole fill: blit the premultiplied pull output down
 		// the chain, then patch black pixels with the local average.
@@ -1156,10 +1311,13 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 	// View-relative LOD cap: view covers levels 1..N, so max lod is N-2.
 	int32_t maxViewLod = doFill ? static_cast<int32_t>(s->mipLevels) - 2 : -1;
 	int32_t fillMode = fillMode_;
+	float fillWeightPow = fillWeightPow_;
 	vkCmdPushConstants(s->cmd, s->fillPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
 	                   sizeof(maxViewLod), &maxViewLod);
 	vkCmdPushConstants(s->cmd, s->fillPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
 	                   sizeof(maxViewLod), sizeof(fillMode), &fillMode);
+	vkCmdPushConstants(s->cmd, s->fillPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+	                   2 * sizeof(maxViewLod), sizeof(fillWeightPow), &fillWeightPow);
 	vkCmdDispatch(s->cmd, gx, gy, 1);
 	if (s->hasTimestamps)
 		vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 5);

@@ -75,15 +75,20 @@ public:
 	// Hole-fill background weighting exponent: pull stores
 	// (rgb*w, w) with w = pow(depth, p), so the mip average is biased
 	// toward background (deep) pixels and the occluding foreground
-	// stops smearing into disocclusions. p = 0 restores the uniform
-	// average. Tunable at runtime; takes effect on the next Warp().
+	// stops smearing into disocclusions. The fill pass (warp_fill.comp
+	// weightPow push constant, same value) re-applies pow(depth, p) to
+	// the mode 0/1 averaging taps in full precision, restoring the bias
+	// the 8-bit mip chain dilutes at coarse LODs. p = 0 restores the
+	// uniform average. Tunable at runtime; takes effect on the next Warp().
 	void SetFillWeightPow(float p) { fillWeightPow_ = p; }
 
 	// Hole-fill variant for the fill pass (warp_fill.comp push
 	// constant): 0 = legacy mip-chain average, 1 = depth-guided local
-	// average with mip fallback. Takes effect on the next Warp().
-	// Out-of-range values fall back to 0 in-shader (unknown modes must
-	// never produce garbage).
+	// average with mip fallback, 2 = directional BG march with mip
+	// fallback, 3 = background extrapolate with mip fallback,
+	// 4 = bilateral gather with mip fallback. Takes effect on the next
+	// Warp(). Out-of-range values fall back to 0 in-shader (unknown
+	// modes must never produce garbage).
 	void SetFillMode(int m) { fillMode_ = m; }
 
 	// Background stretch for the pull pass (warp_pull.comp tune.y): 0
@@ -93,11 +98,23 @@ public:
 	// to the blur fallback. Takes effect on the next Warp().
 	void SetStretchRadius(int r) { stretchRadius_ = r; }
 
+	// Temporal BG cache (persistent half-res background layer,
+	// orthogonal to every fillMode): when enabled, Warp() ingests
+	// valid pull pixels into bgColor/bgDepth on static frames and
+	// projects cached texels into holes BEFORE the fill pass, so the
+	// cache sits underneath any fill mode (0..4). Disabled by default
+	// (zero behavior change). Takes effect on the next Warp(). A fresh
+	// Upload() invalidates the cache (re-primed on the next static
+	// Warp). Extra GPU memory at 1024x1024: 2x 512x512x4 B = 2 MiB.
+	void SetTemporalCacheEnabled(bool e) { temporalCacheEnabled_ = e; }
+	bool TemporalCacheEnabled() const { return temporalCacheEnabled_; }
+
 	// Warp the uploaded frame from (srcPose, srcProj) to
 	// (dstPose, dstProj) and download the RGB8 result into outColor
 	// (width*height*4 bytes). holeRadius > 0 enables hole filling:
-	// SetFillMode selects the blur variant (0 legacy mip-chain
-	// average, 1 depth-guided local average with mip fallback), and
+	// SetFillMode selects the fill variant (0 legacy mip-chain
+	// average, 1 depth-guided, 2 directional march, 3 BG extrapolate,
+	// 4 bilateral gather, each with mip fallback), and
 	// SetStretchRadius>0 additionally copies the deepest nearby donor
 	// into holes first (mesh-warp look) with blur as the fallback; 0
 	// leaves disocclusions black. Filled regions are the
@@ -149,6 +166,19 @@ private:
 	float fillWeightPow_ = 1.0f;
 	int fillMode_ = 0;
 	int stretchRadius_ = 0;
+	bool temporalCacheEnabled_ = false;
+	// Host-side temporal gating: the cache ingests only on static
+	// frames (intra-warp src/dst delta < 2mm / 0.3deg). bgValid_ is
+	// set by the first static update and cleared by Upload().
+	bool bgValid_ = false;
+	Pose prevSrcPose_{};
+	Pose prevDstPose_{};
+	bool havePrevPose_ = false;
+	// World-space linear velocity stub ((P0-P1)*alpha, alpha = 1):
+	// placeholder for motion-compensated projection. Full per-pixel
+	// GFFE history is follow-up work.
+	float lastVel_[3] = {0.0f, 0.0f, 0.0f};
+	bool lastStatic_ = false;
 	float lastCoverage_ = -1.0f;
 	GpuTimes lastGpu_{};
 	std::vector<uint32_t> lastSplat_;

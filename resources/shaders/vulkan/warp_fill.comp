@@ -13,16 +13,27 @@
  * disocclusion, far cheaper than a compute pyramid — blits are
  * fixed-function). LOD choice (view-relative, view starts at image
  * level 1): lod 2 is an 8x8 footprint, lod 5 a 64x64 footprint,
- * maxViewLod the whole frame.
+ * maxViewLod the whole frame. With weightPow > 0 the fine LOD taps
+ * blend with footprint-probe weights pow(deepest depth, p); the
+ * whole-frame tap stays a last resort. p <= 0 is the uniform average.
  *
- * fillMode 1 (depth-guided): first combine the finest stable mip taps
- * (view lod 0 = image level 1, 2x2 footprints) over a 3x3 neighborhood,
- * rejecting taps on the foreground side of the local background depth
- * (deepest valid splat in the 5x5 full-res window). Falls back to the
- * legacy mip taps when nothing local is valid (wide holes). Stays a
- * safe blur but stops at depth edges instead of smearing the occluder
- * across the gap, and keeps 1-2px cracks tight instead of blurring
- * them with an 8x8 minimum footprint.
+ * fillMode 1 (depth-guided): finest stable mip taps (view lod 0) over
+ * a 3x3 neighborhood, rejecting foreground-side taps, falling back to
+ * the legacy taps for wide holes. Tap weights additionally carry
+ * pow(tapDepth, weightPow) to restore the pull bias the 8-bit mip
+ * chain dilutes.
+ *
+ * fillMode 2 (directional march): 1D 4-dir rays (up to 32px) to the
+ * nearest background-depth texel; gated lod-0 average re-centered on
+ * the hit, else mip fallback. Nearest-hit bounds streaks to their own
+ * side (cf. square-window deepest search).
+ *
+ * fillMode 3 (background extrapolate): hard 1-sided BG extend — copy
+ * the nearest background-gated lod-0 tap (2px dilate), else mip
+ * fallback. Never copies foreground across an edge.
+ *
+ * fillMode 4 (bilateral gather): same 5x5 bgDepth + 3x3 lod-0 taps as
+ * mode 1 with w = spatial_G * depth_G * color_G, else mip fallback.
  */
 
 #version 450
@@ -36,7 +47,8 @@ layout(set = 0, binding = 2) uniform sampler2D dstMips;
 layout(push_constant) uniform Push
 {
 	int maxViewLod;
-	int fillMode; // 0 = legacy mip average, 1 = depth-guided local average + mip fallback
+	int fillMode; // 0 legacy, 1 guided, 2 directional, 3 bgextrap, 4 bilateral
+	float weightPow; // BG exponent for modes 0/1; <=0 = uniform
 } pc;
 
 #define SPLAT_EMPTY 0xffffffffu
@@ -47,6 +59,47 @@ layout(push_constant) uniform Push
 // linearly to zero weight. Far-plane slopes vary slowly in nonlinear
 // space, so 0.02 keeps genuine background while killing the occluder.
 #define DEPTH_TOL 0.02
+// March radius in px (mode 2): bounds the worst streak to half a 64px
+// gap and caps cost at 4*32 splat taps per hole pixel.
+#define MARCH_RADIUS 32
+// Bilateral gather sigmas (mode 4): sigmaS ~1px, sigmaD = DEPTH_TOL
+// scale, sigmaC ~0.25 in un-premultiplied rgb distance.
+#define BILAT_SIGMA_S 1.0
+#define BILAT_SIGMA_D 0.02
+#define BILAT_SIGMA_C 0.25
+
+// Weight for one legacy LOD tap: pow() of the deepest valid full-res
+// splat over a sparse 3x3 probe scaled to the tap footprint (stride
+// 2^lod px: coarse taps cover many full-res pixels, and the hole pixel
+// itself is usually EMPTY, so a single center load would just read the
+// hole). Same loop shape as the guided bgDepth scan (structured ifs
+// only, no continue: see the note in warp_pull). An all-EMPTY probe
+// keeps weight 1.0 instead of skipping the tap: its footprint may still
+// straddle valid donors (that straddle is what carries stretch donors
+// into wide holes), and scaling one tap's rgb and alpha by the same
+// factor is value-neutral on its own — the weight only steers the
+// blend between LODs. Out-of-range depths (including NaN, which fails
+// both comparisons) also fall back to 1.0.
+float tapProbeWeight(ivec2 xy, ivec2 size, int stride)
+{
+	float best = -1.0;
+	for (int oy = -1; oy <= 1; oy++) {
+		for (int ox = -1; ox <= 1; ox++) {
+			ivec2 sxy =
+			    clamp(xy + ivec2(ox * stride, oy * stride), ivec2(0), size - ivec2(1));
+			uint e = imageLoad(splatDepth, sxy).x;
+			if (e != SPLAT_EMPTY) {
+				float d = float(e) / DEPTH_SCALE;
+				if (d > best)
+					best = d;
+			}
+		}
+	}
+	if (best < 0.0 || best > 1.0)
+		return 1.0;
+	return pow(clamp(best, 1e-6, 1.0), pc.weightPow);
+}
+
 
 void main()
 {
@@ -65,6 +118,31 @@ void main()
 		imageStore(dstImg, xy, vec4(v.rgb / v.a, 1.0));
 		return;
 	}
+	// Directional-march scratch: function scope, NOT block scope (see
+	// the lavapipe loop-carried-state note in warp_pull.comp — inits on
+	// block-scope loop-carried state read back stale there). Assigned
+	// before the march loop below and re-verified against splatDepth
+	// before the store, so staleness can only cause a blur fallback.
+	ivec2 marchXY_N = ivec2(-1);
+	ivec2 marchXY_S = ivec2(-1);
+	ivec2 marchXY_E = ivec2(-1);
+	ivec2 marchXY_W = ivec2(-1);
+	int marchDist_N = -1;
+	int marchDist_S = -1;
+	int marchDist_E = -1;
+	int marchDist_W = -1;
+	float marchDepth_N = -1.0;
+	float marchDepth_S = -1.0;
+	float marchDepth_E = -1.0;
+	float marchDepth_W = -1.0;	// NOTE: mode-3 loop-carried state lives at function scope (lavapipe
+	// reads back stale slots for block-scope loop-carried initializers;
+	// see the note in warp_pull.comp). Re-initialized on entry to the
+	// mode-3 branch below; the initializers here only silence warnings.
+	float bgExBg = -1.0;
+	vec3 bgExRgb = vec3(0.0);
+	float bgExA = 0.0;
+	int bgExD2 = 1073741823;
+	float bgExDepth = -1.0;
 
 	// Fill disabled: holes keep the pull result (black).
 	if (pc.maxViewLod < 0) {
@@ -73,7 +151,6 @@ void main()
 	}
 
 	vec2 tuv = (vec2(xy) + vec2(0.5)) / vec2(size);
-
 	// Depth-guided local average (mode 1). The finest stable taps are
 	// view lod 0 (image level 1): level 0 is being written by this same
 	// dispatch, so it cannot be safely re-read for neighbors.
@@ -109,9 +186,17 @@ void main()
 						if (e != SPLAT_EMPTY) {
 							float tapDepth = float(e) / DEPTH_SCALE;
 							float dw = 1.0 - clamp((bgDepth - tapDepth) / DEPTH_TOL, 0.0, 1.0);
+							// Background re-weight: taps centered on
+							// deep pixels outweigh foreground-edge
+							// taps, restoring the pull bias the 8-bit
+							// mip chain diluted. p <= 0 is the uniform
+							// (backward compatible) average.
+							float ww = (pc.weightPow <= 0.0) ?
+							    1.0 :
+							    pow(clamp(tapDepth, 1e-6, 1.0), pc.weightPow);
 							if (dw > 0.0) {
-								sumRgb += c.rgb * dw;
-								sumA += c.a * dw;
+								sumRgb += c.rgb * (dw * ww);
+								sumA += c.a * (dw * ww);
 							}
 						}
 					}
@@ -126,12 +211,403 @@ void main()
 		}
 	}
 
+
+	// Directional background march (mode 2). Same 5x5 background depth
+	// as mode 1, then one 1D ray per cardinal direction: the first
+	// texel at background depth wins the ray; the nearest winning ray
+	// (tie-break: deepest) supplies the color. Nearest-hit bounds every
+	// streak to its own side of the gap, where the square-window
+	// deepest search drags the far side across the whole hole.
+	// Cost per hole pixel: 25 (bg window) + up to 4*MARCH_RADIUS splat
+	// imageLoads (rays stop loading once hit, so tight holes cost ~4-8
+	// extra taps) + up to 9 gated lod-0 color taps around the hit + the
+	// legacy fallback when no ray hits (wide holes). vs mode 1: 25 + 9
+	// color taps; vs stretch r=4: 81 window taps in pull. Structured
+	// ifs only (no continue/break).
+	if (pc.fillMode == 2) {
+		float bgDepth = -1.0;
+		for (int oy = -2; oy <= 2; oy++) {
+			for (int ox = -2; ox <= 2; ox++) {
+				ivec2 sxy = clamp(xy + ivec2(ox, oy), ivec2(0), size - ivec2(1));
+				uint e = imageLoad(splatDepth, sxy).x;
+				if (e != SPLAT_EMPTY) {
+					float d = float(e) / DEPTH_SCALE;
+					if (d > bgDepth)
+						bgDepth = d;
+				}
+			}
+		}
+		if (bgDepth >= 0.0) {
+			marchDist_N = -1;
+			marchDist_S = -1;
+			marchDist_E = -1;
+			marchDist_W = -1;
+			marchDepth_N = -1.0;
+			marchDepth_S = -1.0;
+			marchDepth_E = -1.0;
+			marchDepth_W = -1.0;
+			marchXY_N = ivec2(-1);
+			marchXY_S = ivec2(-1);
+			marchXY_E = ivec2(-1);
+			marchXY_W = ivec2(-1);
+			// One guarded block per direction: rays that already hit
+			// skip their loads, so narrow holes terminate in a few
+			// steps. OOB steps report no hit (image edge, not a donor).
+			// The bgDepth - DEPTH_TOL gate rejects foreground texels:
+			// a ray crossing the occluder keeps marching past it.
+			for (int s = 1; s <= MARCH_RADIUS; s++) {
+				if (marchDist_N < 0) {
+					ivec2 nxy = xy + ivec2(0, -s);
+					if (nxy.y >= 0) {
+						uint e = imageLoad(splatDepth, nxy).x;
+						if (e != SPLAT_EMPTY) {
+							float d = float(e) / DEPTH_SCALE;
+							if (d >= bgDepth - DEPTH_TOL) {
+								marchDist_N = s;
+								marchDepth_N = d;
+								marchXY_N = nxy;
+							}
+						}
+					}
+				}
+				if (marchDist_S < 0) {
+					ivec2 nxy = xy + ivec2(0, s);
+					if (nxy.y < size.y) {
+						uint e = imageLoad(splatDepth, nxy).x;
+						if (e != SPLAT_EMPTY) {
+							float d = float(e) / DEPTH_SCALE;
+							if (d >= bgDepth - DEPTH_TOL) {
+								marchDist_S = s;
+								marchDepth_S = d;
+								marchXY_S = nxy;
+							}
+						}
+					}
+				}
+				if (marchDist_W < 0) {
+					ivec2 nxy = xy + ivec2(-s, 0);
+					if (nxy.x >= 0) {
+						uint e = imageLoad(splatDepth, nxy).x;
+						if (e != SPLAT_EMPTY) {
+							float d = float(e) / DEPTH_SCALE;
+							if (d >= bgDepth - DEPTH_TOL) {
+								marchDist_W = s;
+								marchDepth_W = d;
+								marchXY_W = nxy;
+							}
+						}
+					}
+				}
+				if (marchDist_E < 0) {
+					ivec2 nxy = xy + ivec2(s, 0);
+					if (nxy.x < size.x) {
+						uint e = imageLoad(splatDepth, nxy).x;
+						if (e != SPLAT_EMPTY) {
+							float d = float(e) / DEPTH_SCALE;
+							if (d >= bgDepth - DEPTH_TOL) {
+								marchDist_E = s;
+								marchDepth_E = d;
+								marchXY_E = nxy;
+							}
+						}
+					}
+				}
+			}
+			// Nearest hit wins; equal distances break toward deeper.
+			// Straight-line ifs (not loop-carried): safe at any scope.
+			ivec2 winXY = ivec2(-1);
+			int winDist = -1;
+			float winDepth = -1.0;
+			if (marchDist_N >= 0) {
+				winXY = marchXY_N;
+				winDist = marchDist_N;
+				winDepth = marchDepth_N;
+			}
+			if (marchDist_S >= 0) {
+				if (winDist < 0 || marchDist_S < winDist ||
+				    (marchDist_S == winDist && marchDepth_S > winDepth)) {
+					winXY = marchXY_S;
+					winDist = marchDist_S;
+					winDepth = marchDepth_S;
+				}
+			}
+			if (marchDist_W >= 0) {
+				if (winDist < 0 || marchDist_W < winDist ||
+				    (marchDist_W == winDist && marchDepth_W > winDepth)) {
+					winXY = marchXY_W;
+					winDist = marchDist_W;
+					winDepth = marchDepth_W;
+				}
+			}
+			if (marchDist_E >= 0) {
+				if (winDist < 0 || marchDist_E < winDist ||
+				    (marchDist_E == winDist && marchDepth_E > winDepth)) {
+					winXY = marchXY_E;
+					winDist = marchDist_E;
+					winDepth = marchDepth_E;
+				}
+			}
+			if (winDist >= 0) {
+				// Re-verify the winner against the stable splat image
+				// (same recipe as warp_pull.comp): a stale march state
+				// fails here and falls through to blur; genuine winners
+				// always match (same texel, same bits).
+				ivec2 vxy = clamp(winXY, ivec2(0), size - ivec2(1));
+				uint ve = imageLoad(splatDepth, vxy).x;
+				if (ve != SPLAT_EMPTY) {
+					float vd = float(ve) / DEPTH_SCALE;
+					if (abs(vd - winDepth) < 0.000001 && vd >= bgDepth - DEPTH_TOL) {
+						// Color = the mode-1 gated 3x3 lod-0 average
+						// re-centered on the hit. A single lod-0 tap at
+						// the hit straddles the depth edge too often: its
+						// 2x2 footprint blends the adjacent foreground
+						// into edge hits (measured +16 white leak on a
+						// 122px strip in the synthetic A/B). The gate
+						// rejects those foreground-side taps, leaving a
+						// pure-background mean. Only a reprojected-out
+						// donor (splat valid, pull hole: no valid gated
+						// tap) falls through to legacy below.
+						vec2 huv = (vec2(vxy) + vec2(0.5)) / vec2(size);
+						vec2 stepUV = 2.0 / vec2(size);
+						vec3 sumRgb = vec3(0.0);
+						float sumA = 0.0;
+						for (int oy = -1; oy <= 1; oy++) {
+							for (int ox = -1; ox <= 1; ox++) {
+								vec4 c = textureLod(dstMips, huv + vec2(float(ox), float(oy)) * stepUV, 0.0);
+								if (c.a >= VALID_EPS) {
+									ivec2 sxy = clamp(vxy + ivec2(ox * 2, oy * 2), ivec2(0), size - ivec2(1));
+									uint e = imageLoad(splatDepth, sxy).x;
+									if (e != SPLAT_EMPTY) {
+										float tapDepth = float(e) / DEPTH_SCALE;
+										float dw = 1.0 - clamp((bgDepth - tapDepth) / DEPTH_TOL, 0.0, 1.0);
+										if (dw > 0.0) {
+											sumRgb += c.rgb * dw;
+											sumA += c.a * dw;
+										}
+									}
+								}
+							}
+						}
+						if (sumA >= VALID_EPS) {
+							imageStore(dstImg, xy, vec4(sumRgb / sumA, 1.0));
+							return;
+						}
+						// Verified hit but no valid gated tap (donor
+						// reprojects out of source: splat valid, pull
+						// hole) — legacy fallback below.
+					}
+				}
+			}
+			// No ray hit (wide hole / FG-walled): fall through to the
+			// mip fallback below.
+		}
+	}
+
+
+	// Background extrapolate (mode 3): hard 1-sided extend of the
+	// background. Same 5x5 deepest-valid bgDepth as mode 1, but instead
+	// of a weighted average, copy the NEAREST background-gated view-lod-0
+	// tap directly. A hole pixel adjacent (within 2px) to background is
+	// patched with exact background color, so wide disocclusions shrink
+	// by ~2px on the background side to thin cracks the mip fallback
+	// finishes; foreground edges stay hard because the donor gate
+	// (tapDepth >= bgDepth - DEPTH_TOL) never copies the occluder across
+	// the edge. Level 0 is being written by this dispatch, so neighbors
+	// come from dstMips lod 0 (image level 1, stable) + splatDepth
+	// (read-only, stable). Structured ifs only (no continue/break).
+	if (pc.fillMode == 3) {
+		bgExBg = -1.0;
+		bgExRgb = vec3(0.0);
+		bgExA = 0.0;
+		bgExD2 = 1073741823;
+		bgExDepth = -1.0;
+		for (int oy = -2; oy <= 2; oy++) {
+			for (int ox = -2; ox <= 2; ox++) {
+				ivec2 sxy = clamp(xy + ivec2(ox, oy), ivec2(0), size - ivec2(1));
+				uint e = imageLoad(splatDepth, sxy).x;
+				if (e != SPLAT_EMPTY) {
+					float d = float(e) / DEPTH_SCALE;
+					if (d > bgExBg)
+						bgExBg = d;
+				}
+			}
+		}
+		if (bgExBg >= 0.0) {
+			vec2 stepUV = 2.0 / vec2(size);
+			for (int oy = -1; oy <= 1; oy++) {
+				for (int ox = -1; ox <= 1; ox++) {
+					vec4 c = textureLod(dstMips, tuv + vec2(float(ox), float(oy)) * stepUV, 0.0);
+					if (c.a >= VALID_EPS) {
+						// Depth proxy: full-res splat at the tap center
+						// (each view-lod-0 tap spans 2x2 source pixels).
+						ivec2 sxy =
+						    clamp(xy + ivec2(ox * 2, oy * 2), ivec2(0), size - ivec2(1));
+						uint e = imageLoad(splatDepth, sxy).x;
+						if (e != SPLAT_EMPTY) {
+							float tapDepth = float(e) / DEPTH_SCALE;
+							if (tapDepth >= bgExBg - DEPTH_TOL) {
+								int d2 = ox * ox + oy * oy;
+								if (d2 < bgExD2) {
+									bgExD2 = d2;
+									bgExRgb = c.rgb;
+									bgExA = c.a;
+									bgExDepth = tapDepth;
+								} else {
+									if (d2 == bgExD2) {
+										if (tapDepth > bgExDepth) {
+											bgExRgb = c.rgb;
+											bgExA = c.a;
+											bgExDepth = tapDepth;
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+			if (bgExA >= VALID_EPS) {
+				imageStore(dstImg, xy, vec4(bgExRgb / bgExA, 1.0));
+				return;
+			}
+			// No background donor within 2px (wide hole interior):
+			// fall through to the mip fallback below.
+		}
+	}
+
+
+	// Bilateral gather (mode 4): same 5x5 bgDepth + 3x3 lod-0 taps as
+	// mode 1, but the binary depth reject becomes a bilateral product
+	// w = spatial_G * depth_G * color_G. Pass 1 picks the reference
+	// color (un-premultiplied rgb of the nearest valid tap to the
+	// center); pass 2 accumulates the weighted mean. Structured ifs
+	// only (no continue/break: lavapipe-safe).
+	if (pc.fillMode == 4) {
+		float bgDepth = -1.0;
+		for (int oy = -2; oy <= 2; oy++) {
+			for (int ox = -2; ox <= 2; ox++) {
+				ivec2 sxy = clamp(xy + ivec2(ox, oy), ivec2(0), size - ivec2(1));
+				uint e = imageLoad(splatDepth, sxy).x;
+				if (e != SPLAT_EMPTY) {
+					float d = float(e) / DEPTH_SCALE;
+					if (d > bgDepth)
+						bgDepth = d;
+				}
+			}
+		}
+		if (bgDepth >= 0.0) {
+			vec2 stepUV = 2.0 / vec2(size);
+			vec3 refRgb = vec3(0.0);
+			float bestR2 = 1e9;
+			bool haveRef = false;
+			for (int oy = -1; oy <= 1; oy++) {
+				for (int ox = -1; ox <= 1; ox++) {
+					vec4 c = textureLod(dstMips, tuv + vec2(float(ox), float(oy)) * stepUV, 0.0);
+					if (c.a >= VALID_EPS) {
+						ivec2 sxy =
+						    clamp(xy + ivec2(ox * 2, oy * 2), ivec2(0), size - ivec2(1));
+						uint e = imageLoad(splatDepth, sxy).x;
+						if (e != SPLAT_EMPTY) {
+							float r2 = float(ox * ox + oy * oy);
+							if (r2 < bestR2) {
+								bestR2 = r2;
+								refRgb = c.rgb / max(c.a, 1e-6);
+								haveRef = true;
+							}
+						}
+					}
+				}
+			}
+			if (haveRef) {
+				vec3 sumRgb = vec3(0.0);
+				float sumA = 0.0;
+				for (int oy = -1; oy <= 1; oy++) {
+					for (int ox = -1; ox <= 1; ox++) {
+						vec4 c = textureLod(dstMips, tuv + vec2(float(ox), float(oy)) * stepUV, 0.0);
+						if (c.a >= VALID_EPS) {
+							ivec2 sxy =
+							    clamp(xy + ivec2(ox * 2, oy * 2), ivec2(0), size - ivec2(1));
+							uint e = imageLoad(splatDepth, sxy).x;
+							if (e != SPLAT_EMPTY) {
+								float tapDepth = float(e) / DEPTH_SCALE;
+								vec3 tapRgb = c.rgb / max(c.a, 1e-6);
+								vec3 dcol = tapRgb - refRgb;
+								float r2 = float(ox * ox + oy * oy);
+								float wS = exp(-r2 / (2.0 * BILAT_SIGMA_S * BILAT_SIGMA_S));
+								float dd = bgDepth - tapDepth;
+								float wD = exp(-(dd * dd) /
+								    (2.0 * BILAT_SIGMA_D * BILAT_SIGMA_D));
+								float dc2 = dot(dcol, dcol);
+								float wC = exp(-dc2 /
+								    (2.0 * BILAT_SIGMA_C * BILAT_SIGMA_C));
+								float w = wS * wD * wC;
+								if (w > 0.0) {
+									sumRgb += c.rgb * w;
+									sumA += c.a * w;
+								}
+							}
+						}
+					}
+				}
+				if (sumA >= VALID_EPS) {
+					imageStore(dstImg, xy, vec4(sumRgb / sumA, 1.0));
+					return;
+				}
+			}
+			// Nothing locally valid (wide hole): fall through to the
+			// mip fallback below.
+		}
+	}
+
+
 	int lodB = min(5, pc.maxViewLod);
-	vec4 c = textureLod(dstMips, tuv, 2.0);
-	if (c.a < VALID_EPS)
-		c = textureLod(dstMips, tuv, float(lodB));
-	if (c.a < VALID_EPS)
-		c = textureLod(dstMips, tuv, float(pc.maxViewLod));
+	if (pc.weightPow <= 0.0) {
+		// Uniform average (backward compatible): first valid LOD wins.
+		vec4 c = textureLod(dstMips, tuv, 2.0);
+		if (c.a < VALID_EPS)
+			c = textureLod(dstMips, tuv, float(lodB));
+		if (c.a < VALID_EPS)
+			c = textureLod(dstMips, tuv, float(pc.maxViewLod));
+		if (c.a < VALID_EPS)
+			return; // Nothing valid anywhere: stays black.
+		imageStore(dstImg, xy, vec4(c.rgb / c.a, 1.0));
+		return;
+	}
+	// Depth-weighted average of the fine LOD taps: each valid tap is
+	// weighted by its footprint-probe weight, so taps whose footprint
+	// sits on background outweigh foreground-edge taps and the occluder
+	// stops smearing into disocclusions. Blending (instead of
+	// first-valid-wins) keeps no single LOD's 8-bit rounding in charge
+	// of the hole color. The whole-frame tap stays out of the blend as
+	// the last resort: its frame-mean content would otherwise drag every
+	// hole toward the frame average (and bury the stretch donors).
+	// Weights are always positive, so the black set is exactly the
+	// uniform path's (a hole stays black only when every tap, including
+	// the whole-frame fallback, is invalid). Constant cost per hole
+	// (at most 2 fine taps + up to 18 probe loads + 1 fallback tap).
+	int lodA = min(2, pc.maxViewLod);
+	vec4 cA = textureLod(dstMips, tuv, float(lodA));
+	vec4 cB = textureLod(dstMips, tuv, float(lodB));
+	float WA = tapProbeWeight(xy, size, 1 << lodA);
+	float WB = (lodB != lodA) ? tapProbeWeight(xy, size, 1 << lodB) : 0.0;
+	vec3 sumRgb = vec3(0.0);
+	float sumA = 0.0;
+	if (cA.a >= VALID_EPS && WA > 0.0) {
+		sumRgb += cA.rgb * WA;
+		sumA += cA.a * WA;
+	}
+	if (cB.a >= VALID_EPS && WB > 0.0) {
+		sumRgb += cB.rgb * WB;
+		sumA += cB.a * WB;
+	}
+	if (sumA >= VALID_EPS) {
+		imageStore(dstImg, xy, vec4(sumRgb / sumA, 1.0));
+		return;
+	}
+	// Nothing fine valid (wide hole): whole-frame single tap, exactly
+	// the uniform path's footprint, so the stretch-donor straddle flow
+	// into wide holes is preserved.
+	vec4 c = textureLod(dstMips, tuv, float(pc.maxViewLod));
 	if (c.a < VALID_EPS)
 		return; // Nothing valid anywhere: stays black.
 	imageStore(dstImg, xy, vec4(c.rgb / c.a, 1.0));

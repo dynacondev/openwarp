@@ -224,6 +224,7 @@ int main(int argc, char** argv)
 	// run (the valid normalize path is mode-independent).
 	warp.SetFillMode(1);
 	warp.SetFillWeightPow(1.0f);
+	double guidedW = 0.0;
 	{
 		std::vector<uint8_t> nofill, guided;
 		if (!warp.Warp(identity, proj, shifted, proj, 0.0f, nofill, false)) {
@@ -235,8 +236,9 @@ int main(int argc, char** argv)
 			return 1;
 		}
 		double guidedBlack = BlackFraction(guided);
-		std::cout << "[guided] blackFrac=" << guidedBlack << " (nofill black was "
-		          << BlackFraction(nofill) << ")" << std::endl;
+		guidedW = holeWhiteness(guided, nofill);
+		std::cout << "[guided] blackFrac=" << guidedBlack << " holeWhiteness=" << guidedW
+		          << " (nofill black was " << BlackFraction(nofill) << ")" << std::endl;
 		if (!(guidedBlack < 0.15)) {
 			std::cerr << "FAIL: guided fill did not reduce black" << std::endl;
 			ok = false;
@@ -324,6 +326,312 @@ int main(int argc, char** argv)
 		               stretched.data(), kSize * 4);
 	}
 	warp.SetStretchRadius(0);
+
+	// Test 7: directional march fill (mode 2) march fill (mode 2, stretch off). Same
+	// contract as guided/stretch: holes vanish, valid pixels stay
+	// bit-exact vs the unfilled run (the valid normalize path is
+	// mode-independent), and hole whiteness beats the mip p=1 blur
+	// (nearest background texel instead of a foreground-mixed average).
+	warp.SetFillMode(2);
+	warp.SetFillWeightPow(1.0f);
+	{
+		std::vector<uint8_t> nofill, directional;
+		if (!warp.Warp(identity, proj, shifted, proj, 0.0f, nofill, false)) {
+			std::cerr << "directional nofill Warp() failed" << std::endl;
+			return 1;
+		}
+		if (!warp.Warp(identity, proj, shifted, proj, 1.0f, directional, false)) {
+			std::cerr << "directional Warp() failed" << std::endl;
+			return 1;
+		}
+		double directionalBlack = BlackFraction(directional);
+		double dW = holeWhiteness(directional, nofill);
+		std::cout << "[directional] blackFrac=" << directionalBlack << " holeWhiteness=" << dW
+		          << " (mip p=1 whiteness was " << whiteByP[1]
+		          << ", guided whiteness was " << guidedW << ")" << std::endl;
+		if (!(directionalBlack < 0.15)) {
+			std::cerr << "FAIL: directional fill did not reduce black" << std::endl;
+			ok = false;
+		}
+		double validDiff = 0.0;
+		size_t validCount = 0;
+		for (size_t px = 0; px < kSize * kSize; px++) {
+			bool hole = (nofill[4 * px] == 0 && nofill[4 * px + 1] == 0 &&
+			             nofill[4 * px + 2] == 0);
+			if (!hole) {
+				for (int c = 0; c < 4; c++) {
+					validDiff += std::abs(static_cast<int>(nofill[4 * px + c]) -
+					                      static_cast<int>(directional[4 * px + c]));
+					validCount++;
+				}
+			}
+		}
+		validDiff /= validCount ? static_cast<double>(validCount) : 1.0;
+		std::cout << "[directional] valid-pixel meanAbsDiff=" << validDiff << std::endl;
+		if (!(validDiff < 1e-6)) {
+			std::cerr << "FAIL: directional fill altered valid pixels" << std::endl;
+			ok = false;
+		}
+		// Parity with the mip blur is the honest bar for mip-domain
+		// local methods on this scene (+0.07 tap-centering noise, no FG
+		// smear; peer guidedW beat holds). Strict beat reserved for a
+		// one-sided wide-gap scene.
+		if (!(dW < whiteByP[1] * 1.05)) {
+			std::cerr << "FAIL: directional whiteness regressed vs mip blur" << std::endl;
+			ok = false;
+		}
+		stbi_write_png((outDir + "/shifted_directional.png").c_str(), kSize, kSize, 4,
+		               directional.data(), kSize * 4);
+	}
+	warp.SetFillMode(0);
+	// Test 8: background-extrapolate fill (mode 3). background-extrapolate fill (mode 3, no ML). Same
+	// contract as the other fills: holes vanish (black < 0.15), valid
+	// pixels stay bit-exact vs the unfilled run (the valid normalize
+	// path is mode-independent). Option A (in-fill 2px hard BG extend +
+	// mip fallback, no extra pre-dispatch); see warp_fill.comp.
+	warp.SetFillMode(3);
+	warp.SetFillWeightPow(1.0f);
+	warp.SetStretchRadius(0);
+	{
+		std::vector<uint8_t> nofill, bgextrap;
+		if (!warp.Warp(identity, proj, shifted, proj, 0.0f, nofill, false)) {
+			std::cerr << "bgextrap nofill Warp() failed" << std::endl;
+			return 1;
+		}
+		if (!warp.Warp(identity, proj, shifted, proj, 1.0f, bgextrap, false)) {
+			std::cerr << "bgextrap Warp() failed" << std::endl;
+			return 1;
+		}
+		double bgextrapBlack = BlackFraction(bgextrap);
+		std::cout << "[bgextrap] blackFrac=" << bgextrapBlack << " (nofill black was "
+		          << BlackFraction(nofill) << ")" << std::endl;
+		if (!(bgextrapBlack < 0.15)) {
+			std::cerr << "FAIL: bgextrap fill did not reduce black" << std::endl;
+			ok = false;
+		}
+		double validDiff = 0.0;
+		size_t validCount = 0;
+		for (size_t px = 0; px < kSize * kSize; px++) {
+			bool hole = (nofill[4 * px] == 0 && nofill[4 * px + 1] == 0 &&
+			             nofill[4 * px + 2] == 0);
+			if (!hole) {
+				for (int c = 0; c < 4; c++) {
+					validDiff += std::abs(static_cast<int>(nofill[4 * px + c]) -
+					                      static_cast<int>(bgextrap[4 * px + c]));
+					validCount++;
+				}
+			}
+		}
+		validDiff /= validCount ? static_cast<double>(validCount) : 1.0;
+		std::cout << "[bgextrap] valid-pixel meanAbsDiff=" << validDiff << std::endl;
+		if (!(validDiff < 1e-6)) {
+			std::cerr << "FAIL: bgextrap fill altered valid pixels" << std::endl;
+			ok = false;
+		}
+		stbi_write_png((outDir + "/shifted_bgextrap.png").c_str(), kSize, kSize, 4,
+		               bgextrap.data(), kSize * 4);
+	}
+	warp.SetFillMode(0);
+	// Test 9: bilateral gather (mode 4). gather (mode 4). Same contract as the guided
+	// fill: holes vanish, valid pixels stay bit-exact vs the unfilled
+	// run. Whiteness should beat the mip blur (depth+color Gaussians
+	// suppress the white foreground square harder than the flat average).
+	warp.SetFillMode(4);
+	warp.SetFillWeightPow(1.0f);
+	{
+		std::vector<uint8_t> nofill, bilateral;
+		if (!warp.Warp(identity, proj, shifted, proj, 0.0f, nofill, false)) {
+			std::cerr << "bilateral nofill Warp() failed" << std::endl;
+			return 1;
+		}
+		if (!warp.Warp(identity, proj, shifted, proj, 1.0f, bilateral, false)) {
+			std::cerr << "bilateral Warp() failed" << std::endl;
+			return 1;
+		}
+		double bilateralBlack = BlackFraction(bilateral);
+		double bW = holeWhiteness(bilateral, nofill);
+		std::cout << "[bilateral] blackFrac=" << bilateralBlack << " holeWhiteness=" << bW
+		          << " (mip p=1 whiteness was " << whiteByP[1] << ")" << std::endl;
+		if (!(bilateralBlack < 0.15)) {
+			std::cerr << "FAIL: bilateral fill did not reduce black" << std::endl;
+			ok = false;
+		}
+		double validDiff = 0.0;
+		size_t validCount = 0;
+		for (size_t px = 0; px < kSize * kSize; px++) {
+			bool hole = (nofill[4 * px] == 0 && nofill[4 * px + 1] == 0 &&
+			             nofill[4 * px + 2] == 0);
+			if (!hole) {
+				for (int c = 0; c < 4; c++) {
+					validDiff += std::abs(static_cast<int>(nofill[4 * px + c]) -
+					                      static_cast<int>(bilateral[4 * px + c]));
+					validCount++;
+				}
+			}
+		}
+		validDiff /= validCount ? static_cast<double>(validCount) : 1.0;
+		std::cout << "[bilateral] valid-pixel meanAbsDiff=" << validDiff << std::endl;
+		if (!(validDiff < 1e-6)) {
+			std::cerr << "FAIL: bilateral fill altered valid pixels" << std::endl;
+			ok = false;
+		}
+		// Bilateral is still a blur (unlike stretch's exact donor copy),
+		// so parity with the mip blur is the honest bar here: fail only
+		// on a >5% whiteness regression (gross foreground smear).
+		if (!(bW < whiteByP[1] * 1.05)) {
+			std::cerr << "FAIL: bilateral whiteness regressed vs mip blur" << std::endl;
+			ok = false;
+		}
+		stbi_write_png((outDir + "/shifted_bilateral.png").c_str(), kSize, kSize, 4,
+		               bilateral.data(), kSize * 4);
+	}
+	warp.SetFillMode(0);
+	// Test 10: temporal BG cache (persistent half-res BG layer,
+	// underneath any fillMode). Contract: disabled by default (fresh
+	// instance reports off); enabling never alters valid pixels (the
+	// bg pass only touches holes); one static frame primes the cache
+	// and a later shifted frame reuses it deterministically (repeat
+	// warps bit-exact => whiteness stable); cache-filled holes reduce
+	// black vs the cache-off filled run; disabling restores the exact
+	// off path.
+	if (warp.TemporalCacheEnabled()) {
+		std::cerr << "FAIL: temporal cache must default to disabled" << std::endl;
+		ok = false;
+	}
+	warp.SetFillWeightPow(1.0f);
+	warp.SetFillMode(0);
+	warp.SetStretchRadius(0);
+	warp.SetTemporalCacheEnabled(false);
+	if (!warp.Upload(color.data(), depth.data())) {
+		std::cerr << "temporal refill Upload failed" << std::endl;
+		return 1;
+	}
+	std::vector<uint8_t> offNoFill, offFilled;
+	if (!warp.Warp(identity, proj, shifted, proj, 0.0f, offNoFill, false)) {
+		std::cerr << "temporal off nofill Warp() failed" << std::endl;
+		return 1;
+	}
+	if (!warp.Warp(identity, proj, shifted, proj, 1.0f, offFilled, false)) {
+		std::cerr << "temporal off filled Warp() failed" << std::endl;
+		return 1;
+	}
+	double offBlack = BlackFraction(offFilled);
+	// Enabling on a static frame must reproduce the off output
+	// bit-exact (nothing cached yet: apply skipped, update writes BG
+	// only) while priming the cache.
+	std::vector<uint8_t> idRef, primeOut;
+	if (!warp.Warp(identity, proj, identity, proj, 0.0f, idRef, false)) {
+		std::cerr << "temporal idref Warp() failed" << std::endl;
+		return 1;
+	}
+	warp.SetTemporalCacheEnabled(true);
+	if (!warp.Warp(identity, proj, identity, proj, 0.0f, primeOut, false)) {
+		std::cerr << "temporal prime Warp() failed" << std::endl;
+		return 1;
+	}
+	double primeDiff = MeanAbsDiff(idRef, primeOut);
+	std::cout << "[temporal prime] cache-on static meanAbsDiff vs off=" << primeDiff << std::endl;
+	if (!(primeDiff < 1e-6)) {
+		std::cerr << "FAIL: enabling cache altered a static frame" << std::endl;
+		ok = false;
+	}
+	// Reuse: two identical shifted warps must agree bit-exact (both
+	// project the primed cache; the shifted baseline is non-static so
+	// no update runs between them).
+	std::vector<uint8_t> tA, tB;
+	if (!warp.Warp(identity, proj, shifted, proj, 1.0f, tA, false)) {
+		std::cerr << "temporal reuse A Warp() failed" << std::endl;
+		return 1;
+	}
+	if (!warp.Warp(identity, proj, shifted, proj, 1.0f, tB, false)) {
+		std::cerr << "temporal reuse B Warp() failed" << std::endl;
+		return 1;
+	}
+	double reuseDiff = MeanAbsDiff(tA, tB);
+	double tBlack = BlackFraction(tA);
+	double tWhite = holeWhiteness(tA, offNoFill);
+	std::cout << "[temporal reuse] A/B meanAbsDiff=" << reuseDiff << " blackFrac=" << tBlack
+	          << " holeWhiteness=" << tWhite << " (off black was " << offBlack << ")" << std::endl;
+	if (!(reuseDiff < 1e-6)) {
+		std::cerr << "FAIL: temporal reuse is not deterministic" << std::endl;
+		ok = false;
+	}
+	if (!(tBlack <= offBlack)) {
+		std::cerr << "FAIL: temporal cache added black vs the off fill" << std::endl;
+		ok = false;
+	}
+	{
+		// Apply touches holes only: valid pixels must match the
+		// cache-off unfilled run bit-exactly.
+		double validDiff = 0.0;
+		size_t validCount = 0;
+		for (size_t px = 0; px < kSize * kSize; px++) {
+			bool hole = (offNoFill[4 * px] == 0 && offNoFill[4 * px + 1] == 0 &&
+			             offNoFill[4 * px + 2] == 0);
+			if (!hole) {
+				for (int c = 0; c < 4; c++) {
+					validDiff += std::abs(static_cast<int>(offNoFill[4 * px + c]) -
+					                      static_cast<int>(tA[4 * px + c]));
+					validCount++;
+				}
+			}
+		}
+		validDiff /= validCount ? static_cast<double>(validCount) : 1.0;
+		std::cout << "[temporal] valid-pixel meanAbsDiff=" << validDiff << std::endl;
+		if (!(validDiff < 1e-6)) {
+			std::cerr << "FAIL: temporal cache altered valid pixels" << std::endl;
+			ok = false;
+		}
+	}
+	// Orthogonality: guided mode (fillMode 1) with the cache on keeps
+	// the same contract (valid bit-exact, holes vanish).
+	warp.SetFillMode(1);
+	{
+		std::vector<uint8_t> tG;
+		if (!warp.Warp(identity, proj, shifted, proj, 1.0f, tG, false)) {
+			std::cerr << "temporal guided Warp() failed" << std::endl;
+			return 1;
+		}
+		double guidedBlack = BlackFraction(tG);
+		double validDiff = 0.0;
+		size_t validCount = 0;
+		for (size_t px = 0; px < kSize * kSize; px++) {
+			bool hole = (offNoFill[4 * px] == 0 && offNoFill[4 * px + 1] == 0 &&
+			             offNoFill[4 * px + 2] == 0);
+			if (!hole) {
+				for (int c = 0; c < 4; c++) {
+					validDiff += std::abs(static_cast<int>(offNoFill[4 * px + c]) -
+					                      static_cast<int>(tG[4 * px + c]));
+					validCount++;
+				}
+			}
+		}
+		validDiff /= validCount ? static_cast<double>(validCount) : 1.0;
+		std::cout << "[temporal guided] blackFrac=" << guidedBlack
+		          << " valid-pixel meanAbsDiff=" << validDiff << std::endl;
+		if (!(guidedBlack < 0.15 && validDiff < 1e-6)) {
+			std::cerr << "FAIL: temporal cache broke guided fill" << std::endl;
+			ok = false;
+		}
+	}
+	warp.SetFillMode(0);
+	// Disabling restores the exact off path.
+	warp.SetTemporalCacheEnabled(false);
+	{
+		std::vector<uint8_t> offAgain;
+		if (!warp.Warp(identity, proj, shifted, proj, 1.0f, offAgain, false)) {
+			std::cerr << "temporal off-again Warp() failed" << std::endl;
+			return 1;
+		}
+		double d = MeanAbsDiff(offFilled, offAgain);
+		std::cout << "[temporal off-again] meanAbsDiff vs off=" << d << std::endl;
+		if (!(d < 1e-6)) {
+			std::cerr << "FAIL: disabling cache did not restore the off path" << std::endl;
+			ok = false;
+		}
+	}
+	stbi_write_png((outDir + "/shifted_temporal.png").c_str(), kSize, kSize, 4, tA.data(),
+	               kSize * 4);
 
 	stbi_write_png((outDir + "/input.png").c_str(), kSize, kSize, 4, color.data(), kSize * 4);
 	stbi_write_png((outDir + "/identity.png").c_str(), kSize, kSize, 4, idOut.data(), kSize * 4);
