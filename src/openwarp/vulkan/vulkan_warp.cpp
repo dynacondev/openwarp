@@ -1033,7 +1033,8 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 	Multiply(dstInvV, dstInvP, pullUbo.dstInv);
 	Multiply(srcProj, viewSrc, pullUbo.srcVP);
 	pullUbo.tune[0] = fillWeightPow_;
-	pullUbo.tune[1] = pullUbo.tune[2] = pullUbo.tune[3] = 0.0f;
+	pullUbo.tune[1] = static_cast<float>(stretchRadius_);
+	pullUbo.tune[2] = pullUbo.tune[3] = 0.0f;
 	std::memcpy(s->uboSplat.mapped, &splatUbo, sizeof(splatUbo));
 	std::memcpy(s->uboPull.mapped, &pullUbo, sizeof(pullUbo));
 

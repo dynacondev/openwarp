@@ -36,8 +36,10 @@ void main()
 
 	vec2 guv = (vec2(srcXY) + vec2(0.5)) / vec2(size);
 
-	// Source depth is standard 0..1 nonlinear.
-	float z = texture(srcDepth, guv).x;
+	// Source depth is standard 0..1 nonlinear. Explicit lod 0:
+	// implicit-derivative texture() in compute is undefined, and the
+	// lattice UVs here mean lod 0 anyway.
+	float z = textureLod(srcDepth, guv, 0.0).x;
 
 	// Far-plane clamp (mesh parity: openwarp_mesh.vert clamps NDC z to
 	// 0.99, i.e. window depth 0.995). Sky/clear pixels sit at exactly

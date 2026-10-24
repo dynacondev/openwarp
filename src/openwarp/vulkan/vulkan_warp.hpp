@@ -86,14 +86,23 @@ public:
 	// never produce garbage).
 	void SetFillMode(int m) { fillMode_ = m; }
 
+	// Background stretch for the pull pass (warp_pull.comp tune.y): 0
+	// disables (holes keep black for the blur fill); >0 searches a
+	// (2r+1)^2 window for the deepest valid donor and copies it
+	// (mesh-warp look). Holes wider than the window still fall through
+	// to the blur fallback. Takes effect on the next Warp().
+	void SetStretchRadius(int r) { stretchRadius_ = r; }
+
 	// Warp the uploaded frame from (srcPose, srcProj) to
 	// (dstPose, dstProj) and download the RGB8 result into outColor
-	// (width*height*4 bytes). holeRadius > 0 enables hole filling
-	// (SetFillMode selects the variant: 0 legacy mip-chain average, 1
-	// depth-guided local average with mip fallback); 0 leaves
-	// disocclusions black. The pull output is premultiplied, so filled
-	// regions are the validity-weighted mean (blurred, never
-	// stretched). Constant cost per hole pixel.
+	// (width*height*4 bytes). holeRadius > 0 enables hole filling:
+	// SetFillMode selects the blur variant (0 legacy mip-chain
+	// average, 1 depth-guided local average with mip fallback), and
+	// SetStretchRadius>0 additionally copies the deepest nearby donor
+	// into holes first (mesh-warp look) with blur as the fallback; 0
+	// leaves disocclusions black. Filled regions are the
+	// validity-weighted mean (blurred, never stretched) except for
+	// stretched texels, which are exact background copies.
 	// srcProj/dstProj are PerspectiveGL/FrustumGL matrices; near/far
 	// must match between the two (same convention as dynacon-vr).
 	// countCoverage also downloads the splat plane and counts filled
@@ -139,6 +148,7 @@ private:
 	bool initialized_ = false;
 	float fillWeightPow_ = 1.0f;
 	int fillMode_ = 0;
+	int stretchRadius_ = 0;
 	float lastCoverage_ = -1.0f;
 	GpuTimes lastGpu_{};
 	std::vector<uint32_t> lastSplat_;

@@ -54,17 +54,16 @@ void main()
 	ivec2 size = imageSize(dstImg);
 	if (xy.x >= size.x || xy.y >= size.y)
 		return;
-	// Valid pixels only need un-premultiplying (divide out the
-	// background weight); the color itself is already right. This also
-	// runs when hole-filling is off, so the no-fill path still shows
-	// straight colors instead of the premultiplied darkening.
-	if (imageLoad(splatDepth, xy).x != SPLAT_EMPTY) {
-		vec4 v = imageLoad(dstImg, xy);
-		if (v.a >= VALID_EPS) {
-			imageStore(dstImg, xy, vec4(v.rgb / v.a, 1.0));
-			return;
-		}
-		// Near-zero weight (depth ~= 0): fall through to the fill.
+	// Valid pixels (pull stored premultiplied (rgb*w, w), including
+	// stretch-filled donors) only need un-premultiplying; the color
+	// itself is already right. This also runs when hole-filling is
+	// off, so the no-fill path still shows straight colors instead of
+	// the premultiplied darkening. Zero-weight pixels fall through to
+	// the fill below.
+	vec4 v = imageLoad(dstImg, xy);
+	if (v.a >= VALID_EPS) {
+		imageStore(dstImg, xy, vec4(v.rgb / v.a, 1.0));
+		return;
 	}
 
 	// Fill disabled: holes keep the pull result (black).
@@ -78,6 +77,7 @@ void main()
 	// Depth-guided local average (mode 1). The finest stable taps are
 	// view lod 0 (image level 1): level 0 is being written by this same
 	// dispatch, so it cannot be safely re-read for neighbors.
+	// Structured ifs only (no continue): see the note in warp_pull.
 	if (pc.fillMode == 1) {
 		// Background depth: deepest valid splat in the 5x5 full-res
 		// window (splatDepth is read-only in this pass: stable).
@@ -86,8 +86,11 @@ void main()
 			for (int ox = -2; ox <= 2; ox++) {
 				ivec2 sxy = clamp(xy + ivec2(ox, oy), ivec2(0), size - ivec2(1));
 				uint e = imageLoad(splatDepth, sxy).x;
-				if (e != SPLAT_EMPTY)
-					bgDepth = max(bgDepth, float(e) / DEPTH_SCALE);
+				if (e != SPLAT_EMPTY) {
+					float d = float(e) / DEPTH_SCALE;
+					if (d > bgDepth)
+						bgDepth = d;
+				}
 			}
 		}
 		if (bgDepth >= 0.0) {
@@ -97,21 +100,21 @@ void main()
 			for (int oy = -1; oy <= 1; oy++) {
 				for (int ox = -1; ox <= 1; ox++) {
 					vec4 c = textureLod(dstMips, tuv + vec2(float(ox), float(oy)) * stepUV, 0.0);
-					if (c.a < VALID_EPS)
-						continue;
-					// Depth proxy: full-res splat at the tap center
-					// (each view-lod-0 tap spans 2x2 source pixels).
-					ivec2 sxy =
-					    clamp(xy + ivec2(ox * 2, oy * 2), ivec2(0), size - ivec2(1));
-					uint e = imageLoad(splatDepth, sxy).x;
-					if (e == SPLAT_EMPTY)
-						continue;
-					float tapDepth = float(e) / DEPTH_SCALE;
-					float dw = 1.0 - clamp((bgDepth - tapDepth) / DEPTH_TOL, 0.0, 1.0);
-					if (dw <= 0.0)
-						continue;
-					sumRgb += c.rgb * dw;
-					sumA += c.a * dw;
+					if (c.a >= VALID_EPS) {
+						// Depth proxy: full-res splat at the tap center
+						// (each view-lod-0 tap spans 2x2 source pixels).
+						ivec2 sxy =
+						    clamp(xy + ivec2(ox * 2, oy * 2), ivec2(0), size - ivec2(1));
+						uint e = imageLoad(splatDepth, sxy).x;
+						if (e != SPLAT_EMPTY) {
+							float tapDepth = float(e) / DEPTH_SCALE;
+							float dw = 1.0 - clamp((bgDepth - tapDepth) / DEPTH_TOL, 0.0, 1.0);
+							if (dw > 0.0) {
+								sumRgb += c.rgb * dw;
+								sumA += c.a * dw;
+							}
+						}
+					}
 				}
 			}
 			if (sumA >= VALID_EPS) {

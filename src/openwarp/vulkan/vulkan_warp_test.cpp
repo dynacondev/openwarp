@@ -265,6 +265,66 @@ int main(int argc, char** argv)
 	}
 	warp.SetFillMode(0);
 
+	// Test 6: background stretch (pull radius 4, mip fallback). Holes
+	// copy the deepest nearby donor (mesh-warp look); holes wider than
+	// the window fall back to blur. Contract: holes vanish, valid
+	// pixels stay bit-exact, and the fill is less white than the mip
+	// blur (donor background instead of foreground-mixed average).
+	// NOTE (lavapipe-only): 40px (x=43, y108..147) stay black here.
+	// Splat dump proves the 9x9 window there is truly empty, so the
+	// loop assigns nothing — yet a store happens (stale loop-carried
+	// state slips the >= 0 guard on lavapipe; sentinels/probes confirm
+	// the inits are ignored). Re-verification + fallback should catch
+	// it and don't on lavapipe. Real-GPU check pending: if clean there
+	// this is a lavapipe codegen quirk, not a logic bug.
+	{
+		std::vector<uint8_t> nofill, stretched;
+		warp.SetStretchRadius(0);
+		if (!warp.Warp(identity, proj, shifted, proj, 0.0f, nofill, false)) {
+			std::cerr << "stretch nofill Warp() failed" << std::endl;
+			return 1;
+		}
+		warp.SetStretchRadius(4);
+		if (!warp.Warp(identity, proj, shifted, proj, 1.0f, stretched, false)) {
+			std::cerr << "stretch Warp() failed" << std::endl;
+			return 1;
+		}
+		double stretchedBlack = BlackFraction(stretched);
+		double sW = holeWhiteness(stretched, nofill);
+		std::cout << "[stretch] blackFrac=" << stretchedBlack << " holeWhiteness=" << sW
+		          << " (mip p=1 whiteness was " << whiteByP[1] << ")" << std::endl;
+		if (!(stretchedBlack < 0.15)) {
+			std::cerr << "FAIL: stretch fill did not reduce black" << std::endl;
+			ok = false;
+		}
+		double validDiff = 0.0;
+		size_t validCount = 0;
+		for (size_t px = 0; px < kSize * kSize; px++) {
+			bool hole = (nofill[4 * px] == 0 && nofill[4 * px + 1] == 0 &&
+			             nofill[4 * px + 2] == 0);
+			if (!hole) {
+				for (int c = 0; c < 4; c++) {
+					validDiff += std::abs(static_cast<int>(nofill[4 * px + c]) -
+					                      static_cast<int>(stretched[4 * px + c]));
+					validCount++;
+				}
+			}
+		}
+		validDiff /= validCount ? static_cast<double>(validCount) : 1.0;
+		std::cout << "[stretch] valid-pixel meanAbsDiff=" << validDiff << std::endl;
+		if (!(validDiff < 1e-6)) {
+			std::cerr << "FAIL: stretch fill altered valid pixels" << std::endl;
+			ok = false;
+		}
+		if (!(sW < whiteByP[1])) {
+			std::cerr << "FAIL: stretch did not beat mip blur whiteness" << std::endl;
+			ok = false;
+		}
+		stbi_write_png((outDir + "/shifted_stretched.png").c_str(), kSize, kSize, 4,
+		               stretched.data(), kSize * 4);
+	}
+	warp.SetStretchRadius(0);
+
 	stbi_write_png((outDir + "/input.png").c_str(), kSize, kSize, 4, color.data(), kSize * 4);
 	stbi_write_png((outDir + "/identity.png").c_str(), kSize, kSize, 4, idOut.data(), kSize * 4);
 	stbi_write_png((outDir + "/shifted.png").c_str(), kSize, kSize, 4, shiftOut.data(),
