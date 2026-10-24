@@ -214,7 +214,8 @@ uint32_t FindMemory(VkPhysicalDevice phys, uint32_t bits, VkMemoryPropertyFlags 
 }
 
 bool CreateBuffer(VulkanWarp::State* s, VkDeviceSize size, VkBufferUsageFlags usage,
-                  VkMemoryPropertyFlags memFlags, VulkanWarp::State::Buffer& b, std::string* error)
+                  VkMemoryPropertyFlags memFlags, VulkanWarp::State::Buffer& b, std::string* error,
+                  VkMemoryPropertyFlags memFallback = 0)
 {
 	VkBufferCreateInfo ci{};
 	ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -226,6 +227,11 @@ bool CreateBuffer(VulkanWarp::State* s, VkDeviceSize size, VkBufferUsageFlags us
 	VkMemoryRequirements req{};
 	vkGetBufferMemoryRequirements(s->device, b.handle, &req);
 	uint32_t memIdx = FindMemory(s->phys, req.memoryTypeBits, memFlags);
+	if (memIdx == UINT32_MAX && memFallback != 0) {
+		memIdx = FindMemory(s->phys, req.memoryTypeBits, memFallback);
+		if (memIdx != UINT32_MAX)
+			std::cout << "[vulkan] preferred buffer heap unavailable, using fallback" << std::endl;
+	}
 	if (memIdx == UINT32_MAX) {
 		if (error)
 			*error = "no suitable buffer memory type";
@@ -643,10 +649,20 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 	                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
 	                  s->uboPull, error))
 		return false;
+	// Staging prefers a HOST_CACHED heap: the download memcpy reads
+	// 4 MiB/frame from it (plus the splat plane on coverage warps),
+	// and reads from write-combined BAR memory run at ~100 MB/s (~15+
+	// ms/frame on discrete NVIDIA) while cached reads run at GB/s.
+	// Uploads are writes (WC-friendly either way) and GPU transfers
+	// DMA from system RAM at PCIe speed in both cases. iGPUs and
+	// lavapipe serve cached system RAM either way; the fallback keeps
+	// exotic drivers working.
 	if (!CreateBuffer(s, 2 * planeBytes,
 	                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-	                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-	                  s->staging, error))
+	                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+	                          VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+	                  s->staging, error,
+	                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
 		return false;
 
 	// Samplers: color linear/border-black, depth nearest/edge (dynacon parity).
