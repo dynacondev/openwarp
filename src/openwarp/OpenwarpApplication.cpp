@@ -30,6 +30,7 @@ const char* OpenwarpApplication::VulkanFillName(VulkanFillMethod m)
     case VulkanFillMethod::Off: return "Off (black)";
     case VulkanFillMethod::MipChain: return "Mip-chain blur";
     case VulkanFillMethod::DepthGuided: return "Depth-guided blur";
+    case VulkanFillMethod::Stretch: return "Background stretch";
     default: return "<unknown>";
     }
 }
@@ -52,7 +53,8 @@ float OpenwarpApplication::VulkanFillHoleRadius() const
     switch (vulkanFill) {
     case VulkanFillMethod::Off: return 0.0f;
     case VulkanFillMethod::MipChain: return 1.0f;
-    case VulkanFillMethod::DepthGuided: return 1.0f;
+    // Stretch also needs the chain (its blur fallback).
+    case VulkanFillMethod::Stretch: return 1.0f;
     default: return 0.0f;
     }
 }
@@ -61,9 +63,12 @@ int OpenwarpApplication::VulkanFillMode() const
 {
     // Maps onto the warp_fill.comp fillMode push constant.
     switch (vulkanFill) {
+    // Stretch pairs with the legacy mip fallback (guided+stretch
+    // combo is future work).
     case VulkanFillMethod::DepthGuided: return 1;
     case VulkanFillMethod::Off:
     case VulkanFillMethod::MipChain:
+    case VulkanFillMethod::Stretch:
     default: return 0;
     }
 }
@@ -331,15 +336,22 @@ void OpenwarpApplication::drawGUI(){
             if (ImGui::RadioButton(VulkanFillName(m), active))
                 vulkanFill = m;
         }
-        // Mip-chain-only tuning: only shown for fills that use it, so
-        // dead knobs never look live. DepthGuided blends the same
-        // premultiplied weights, so the power applies to it too.
+        // Per-method tuning: only shown for fills that use it, so dead
+        // knobs never look live. The power weights every averaging
+        // fill (and stretch donor weights); the radius is stretch-only.
         if (vulkanFill != VulkanFillMethod::Off) {
             ImGui::Text("Fill background weight power");
             ImGui::PushItemWidth(-1);
             ImGui::SliderFloat("##vkfill", &vulkanFillPower, 0.0f, 3.0f);
             ImGui::PopItemWidth();
-        } else {
+        }
+        if (vulkanFill == VulkanFillMethod::Stretch) {
+            ImGui::Text("Stretch radius (px)");
+            ImGui::PushItemWidth(-1);
+            ImGui::SliderInt("##vkstretch", &vulkanStretchRadius, 1, 8);
+            ImGui::PopItemWidth();
+        }
+        if (vulkanFill == VulkanFillMethod::Off) {
             ImGui::TextWrapped("Fill has no tunable parameters.");
         }
 
@@ -651,6 +663,7 @@ bool OpenwarpApplication::doVulkanMeshWarp()
     bool wantCoverage = (vulkanStats.warps % 60) == 0;
     vulkanWarp->SetFillWeightPow(vulkanFillPower);
     vulkanWarp->SetFillMode(VulkanFillMode());
+    vulkanWarp->SetStretchRadius(vulkanFill == VulkanFillMethod::Stretch ? vulkanStretchRadius : 0);
     if(!vulkanWarp->Warp(srcPose, srcProj, dstPose, dstProj, VulkanFillHoleRadius(), vulkanOut,
                          wantCoverage)) {
         std::cerr << "[vulkan] Warp failed (" << vulkanWarp->LastError() << "); disabling."

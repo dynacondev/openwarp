@@ -118,8 +118,9 @@ class Openwarp::OpenwarpApplication{
             Off = 0,      // holes stay black (honest baseline for A/B)
             MipChain = 1, // blit mip-chain blurred local average
             DepthGuided = 2, // depth-guided local average + mip fallback
+            Stretch = 3,  // background stretch (deepest nearby donor) + mip fallback
         };
-        static constexpr int kVulkanFillCount = 3;
+        static constexpr int kVulkanFillCount = 4;
         static const char* VulkanFillName(VulkanFillMethod m);
         void CycleVulkanFill(int dir = 1);
         float VulkanFillHoleRadius() const;
@@ -171,11 +172,15 @@ class Openwarp::OpenwarpApplication{
         } vulkanStats;
         bool vulkanDepthLogged = false;
         uint64_t vulkanDumpCount = 0;
-        // Mip-chain hole fill tuning (only used when vulkanFill is a
-        // fill that averages neighbors; ignored by Off). Higher p
-        // suppresses foreground smear into holes harder (w=pow(depth,p));
-        // 0 = uniform average. Runtime-tunable, tested at 0/1/2.
+        // Fill tuning (ignored by Off). Higher p suppresses foreground
+        // smear into holes harder (w=pow(depth,p)); 0 = uniform average.
+        // Runtime-tunable, tested at 0/1/2. Applies to every averaging
+        // fill (MipChain, DepthGuided) and to stretch donor weights.
         float vulkanFillPower = 1.0f;
+        // Stretch donor search half-width in px ((2r+1)^2 window, only
+        // used by Stretch): larger r stretches wider disocclusions but
+        // costs more per hole pixel.
+        int vulkanStretchRadius = 4;
         double vulkanStatsLastLog = 0.0;
         bool EnsureVulkanWarp();
         bool doVulkanMeshWarp();
