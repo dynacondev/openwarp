@@ -329,6 +329,37 @@ void OpenwarpApplication::Run(bool showGUI){
         if (shouldReproject)
             painted = doReprojection(useRay) || painted;
 
+        if (!painted && showGUI) {
+            // Fully idle (rendering and reprojection both off, or
+            // nothing yet painted): recompose the held frame so the GUI
+            // — and its state readouts — stays alive instead of freezing
+            // with no way to see or recover state. Swapping after a
+            // redraw is safe (no stale-buffer alternation); swapping
+            // with no redraw is what ghosts.
+            bool recomposed = false;
+#ifdef OPENWARP_HAS_VULKAN
+            if (backend == Backend::Vulkan)
+                recomposed = presentCachedVulkanFrame();
+            else
+#endif
+            {
+                // GL direct path keeps no copy: blit front->back so the
+                // back buffer holds the last frame again, then the GUI
+                // draws over it below.
+                int fbW = WIDTH, fbH = HEIGHT;
+                glfwGetFramebufferSize(window, &fbW, &fbH);
+                glReadBuffer(GL_FRONT);
+                glDrawBuffer(GL_BACK);
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                glBlitFramebuffer(0, 0, fbW, fbH, 0, 0, fbW, fbH,
+                                  GL_COLOR_BUFFER_BIT, GL_NEAREST);
+                glReadBuffer(GL_BACK);
+                glDrawBuffer(GL_BACK);
+                recomposed = true;
+            }
+            painted = recomposed;
+        }
+
         if (painted) {
             if(showGUI)
                 drawGUI();
