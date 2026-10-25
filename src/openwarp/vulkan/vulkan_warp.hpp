@@ -83,8 +83,9 @@ public:
 	// Warp the uploaded frame from (srcPose, srcProj) to
 	// (dstPose, dstProj) and download the RGB8 result into outColor
 	// (width*height*4 bytes). holeRadius is reserved for future fills
-	// (>0 will build/sample extra data); currently holes always stay
-	// black, so pass 0. srcProj/dstProj are PerspectiveGL/FrustumGL
+	// (>0 will build/sample extra data); the GPU path currently ignores
+	// it (holes stay black unless the app runs its own post-pass, e.g.
+	// the NN fill). srcProj/dstProj are PerspectiveGL/FrustumGL
 	// matrices; near/far must match between the two (same convention
 	// as dynacon-vr). countCoverage also downloads the splat plane
 	// and counts filled texels (extra copy in the SAME submit, plus a

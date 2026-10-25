@@ -23,6 +23,7 @@
 
 #ifdef OPENWARP_HAS_VULKAN
 #include "vulkan/vulkan_warp.hpp"
+#include "vulkan/vulkan_nn_fill.hpp"
 #endif
 
 #include "openwarp.hpp"
@@ -116,8 +117,9 @@ class Openwarp::OpenwarpApplication{
         // dispatch lives in doVulkanMeshWarp().
         enum class VulkanFillMethod : int {
             Off = 0, // holes stay black (honest baseline for A/B)
+            NnFill = 1, // blur-init TinyFillNet via VulkanNnFill (post-pull CPU pass)
         };
-        static constexpr int kVulkanFillCount = 1;
+        static constexpr int kVulkanFillCount = 2;
         static VulkanFillMethod VulkanFillByIndex(int i);
         static int VulkanFillIndex(VulkanFillMethod m);
         static const char* VulkanFillName(VulkanFillMethod m);
@@ -160,6 +162,12 @@ class Openwarp::OpenwarpApplication{
         // Last applied fill setting (sentinel forces the first warp).
         VulkanFillMethod lastWarpFill = VulkanFillMethod::Off;
         bool lastWarpFillInit = false;
+        // NN hole-fill backend (mode 1 only; lazily loaded so mode 0
+        // never pays for it). nnFillModelPath records the resolved
+        // weights file for the GUI status line.
+        std::unique_ptr<openwarp_vk::VulkanNnFill> nnFill;
+        std::string nnFillModelPath;
+        bool EnsureNnFill();
         // Paced profiling: per-stage CPU ms + counts, logged every ~2 s.
         // gpu*Ms are device times from timestamp queries (when available);
         // the cpu gpu-warp number includes submit/wait + PCIe + memcpys.

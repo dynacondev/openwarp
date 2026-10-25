@@ -124,11 +124,37 @@ if(OPENWARP_ENABLE_VULKAN)
             # Headless compute warp library (Option B port).
             add_library(openwarp_vulkan STATIC
                 src/openwarp/vulkan/vulkan_warp.cpp
-                src/openwarp/vulkan/vulkan_warp.hpp)
+                src/openwarp/vulkan/vulkan_warp.hpp
+                src/openwarp/vulkan/vulkan_nn_fill.cpp
+                src/openwarp/vulkan/vulkan_nn_fill.hpp)
             target_include_directories(openwarp_vulkan PRIVATE
                 "${CMAKE_CURRENT_SOURCE_DIR}/src/openwarp"
                 include/eigen)
             target_link_libraries(openwarp_vulkan PRIVATE Vulkan::Vulkan)
+            # Blur-init weights for the NN hole fill (mode 1). The app
+            # also probes OPENWARP_NN_MODEL + relative ml/weights layouts.
+            target_compile_definitions(openwarp_vulkan PRIVATE
+                "OPENWARP_NN_MODEL_DEFAULT=\"${CMAKE_CURRENT_SOURCE_DIR}/ml/weights/fill_blur_init.onnx\"")
+            # ONNX Runtime C++ (optional): real TinyFillNet inference.
+            # Ubuntu ships no libonnxruntime-dev package and the pip
+            # onnxruntime wheels carry no C++ headers, so point
+            # ONNXRUNTIME_ROOT at a github.com/microsoft/onnxruntime
+            # release tarball dir (include/ + lib/) to enable. Without
+            # it the build stays green and VulkanNnFill runs the mock
+            # box-blur backend (same plumbing + hard-mask composite).
+            set(ONNXRUNTIME_ROOT "" CACHE PATH "Prefix of an onnxruntime release (include/ + lib/)")
+            find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
+                HINTS ${ONNXRUNTIME_ROOT}/include /usr/include/onnxruntime /usr/local/include/onnxruntime)
+            find_library(ONNXRUNTIME_LIB onnxruntime
+                HINTS ${ONNXRUNTIME_ROOT}/lib /usr/lib /usr/local/lib)
+            if(ONNXRUNTIME_INCLUDE_DIR AND ONNXRUNTIME_LIB)
+                message(STATUS "onnxruntime C++ found: ${ONNXRUNTIME_LIB} - NN fill uses ORT")
+                target_include_directories(openwarp_vulkan PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
+                target_link_libraries(openwarp_vulkan PRIVATE ${ONNXRUNTIME_LIB})
+                target_compile_definitions(openwarp_vulkan PRIVATE OPENWARP_HAS_ORT=1)
+            else()
+                message(STATUS "onnxruntime C++ not found - NN fill uses mock box-blur backend")
+            endif()
             set_property(TARGET openwarp_vulkan PROPERTY CXX_STANDARD 17)
             add_dependencies(openwarp_vulkan openwarp_vulkan_shaders)
             target_link_libraries(openwarp PRIVATE openwarp_vulkan)

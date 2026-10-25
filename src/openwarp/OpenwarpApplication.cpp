@@ -28,20 +28,25 @@ const char* OpenwarpApplication::VulkanFillName(VulkanFillMethod m)
 {
     switch (m) {
     case VulkanFillMethod::Off: return "Off (black)";
+    case VulkanFillMethod::NnFill: return "NN fill (blur init)";
     default: return "<unknown>";
     }
 }
 
 OpenwarpApplication::VulkanFillMethod OpenwarpApplication::VulkanFillByIndex(int i)
 {
-    (void)i;
-    return VulkanFillMethod::Off;
+    switch (i) {
+    case 1: return VulkanFillMethod::NnFill;
+    case 0:
+    default: return VulkanFillMethod::Off;
+    }
 }
 
 int OpenwarpApplication::VulkanFillIndex(VulkanFillMethod m)
 {
     switch (m) {
     case VulkanFillMethod::Off: return 0;
+    case VulkanFillMethod::NnFill: return 1;
     default: return 0;
     }
 }
@@ -58,12 +63,14 @@ void OpenwarpApplication::CycleVulkanFill(int dir)
 float OpenwarpApplication::VulkanFillHoleRadius() const
 {
     // Maps the fill selector onto the VulkanWarp::Warp() holeRadius
-    // knob. Only Off exists, so holes always stay black; future fills
-    // return >0 here. HoleRadius stays plumbed so new methods slot in
-    // without touching the Warp() call.
+    // knob. Only Off keeps 0; NnFill returns >0 to mark the hole-aware
+    // path (the GPU pull math ignores it; the NN pass reads the splat
+    // plane for its mask). HoleRadius stays plumbed so new methods slot
+    // in without touching the Warp() call.
     switch (vulkanFill) {
     case VulkanFillMethod::Off:
     default: return 0.0f;
+    case VulkanFillMethod::NnFill: return 1.0f;
     }
 }
 
@@ -74,6 +81,7 @@ int OpenwarpApplication::VulkanFillMode() const
     switch (vulkanFill) {
     case VulkanFillMethod::Off:
     default: return 0;
+    case VulkanFillMethod::NnFill: return 1;
     }
 }
 
@@ -386,6 +394,12 @@ void OpenwarpApplication::drawGUI(){
             if (ImGui::RadioButton(VulkanFillName(m), active))
                 vulkanFill = m;
         }
+        if (vulkanFill == VulkanFillMethod::NnFill) {
+#ifdef OPENWARP_HAS_VULKAN
+            ImGui::TextWrapped("weights: %s",
+                nnFillModelPath.empty() ? "<pending first warp>" : nnFillModelPath.c_str());
+#endif
+        }
         ImGui::TextWrapped("Fill has no tunable parameters.");
 
         ImGui::End();
@@ -530,6 +544,47 @@ void OpenwarpApplication::processInput(){
 }
 
 #ifdef OPENWARP_HAS_VULKAN
+// Resolves + loads the blur-init weights for mode 1. Search order: env
+// OPENWARP_NN_MODEL, build-time default, then common relative layouts.
+// Failure (or infer failure later) keeps the black-hole frame: the NN
+// pass is strictly optional post-processing, never the warp itself.
+bool OpenwarpApplication::EnsureNnFill()
+{
+    if(nnFill && nnFill->Available())
+        return true;
+    std::vector<std::string> cands;
+    if(const char* env = std::getenv("OPENWARP_NN_MODEL"))
+        cands.emplace_back(env);
+#ifdef OPENWARP_NN_MODEL_DEFAULT
+    cands.emplace_back(OPENWARP_NN_MODEL_DEFAULT);
+#endif
+    cands.emplace_back("../ml/weights/fill_blur_init.onnx");
+    cands.emplace_back("./ml/weights/fill_blur_init.onnx");
+    cands.emplace_back("ml/weights/fill_blur_init.onnx");
+    std::string picked;
+    for(auto& c : cands) {
+        std::ifstream probe(c, std::ios::binary);
+        if(probe) {
+            picked = c;
+            break;
+        }
+    }
+    if(picked.empty()) {
+        std::cerr << "[nn-fill] no weights found (set OPENWARP_NN_MODEL); staying black."
+                  << std::endl;
+        return false;
+    }
+    if(!nnFill)
+        nnFill = std::make_unique<openwarp_vk::VulkanNnFill>();
+    std::string error;
+    if(!nnFill->Load(picked, &error)) {
+        std::cerr << "[nn-fill] load failed (" << error << "); staying black." << std::endl;
+        return false;
+    }
+    nnFillModelPath = picked;
+    return true;
+}
+
 bool OpenwarpApplication::EnsureVulkanWarp()
 {
     if(vulkanWarp && vulkanWarp->IsInitialized())
@@ -735,9 +790,13 @@ int OpenwarpApplication::doVulkanMeshWarp()
     std::memcpy(dstProj, projection.data(), sizeof(dstProj));
 
     // Hole fill dispatch: Off maps to holeRadius 0 (honest black for
-    // A/B). fillMode is the switch point for future fills.
-    // Coverage is sampled (1/60 warps): same-submit copy, negligible cost.
-    bool wantCoverage = (vulkanStats.warps % 60) == 0;
+    // A/B). Mode 1 (NnFill) keeps the same GPU warp (fill.comp falls
+    // back to black-hole normalize for unknown modes) and fills on the
+    // CPU afterwards, so the mode-0 path below is bit-identical.
+    // Coverage is sampled (1/60 warps): same-submit copy, negligible
+    // cost — plus every warp under NnFill, which needs the splat plane
+    // as its hole mask.
+    bool wantCoverage = (vulkanStats.warps % 60) == 0 || vulkanFill == VulkanFillMethod::NnFill;
     vulkanWarp->SetFillMode(VulkanFillMode());
     if(!vulkanWarp->Warp(srcPose, srcProj, dstPose, dstProj, VulkanFillHoleRadius(), vulkanOut,
                          wantCoverage)) {
@@ -745,6 +804,16 @@ int OpenwarpApplication::doVulkanMeshWarp()
                   << std::endl;
         vulkanFailed = true;
         return -1;
+    }
+    if(vulkanFill == VulkanFillMethod::NnFill) {
+        const uint32_t* splatPtr = nullptr;
+        const std::vector<uint32_t>& splat = vulkanWarp->LastSplatPlane();
+        if(wantCoverage && splat.size() == px)
+            splatPtr = splat.data();
+        // Any failure keeps vulkanOut as the black-hole frame (logged
+        // inside VulkanNnFill); it can never paint garbage.
+        if(EnsureNnFill())
+            nnFill->Fill(WIDTH, HEIGHT, vulkanOut, splatPtr);
     }
     vulkanStats.warps++;
     haveLastWarpPose = true;
