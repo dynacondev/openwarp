@@ -6,12 +6,8 @@
  * One thread per target pixel: read the splatted foreground depth,
  * unproject with the target inverses and reproject with the source
  * projection, then tap the retained color. Output is PREMULTIPLIED:
- * valid pixels store (rgb*w, w), disoccluded pixels (0,0,0,0) unless
- * the background stretch is enabled, in which case holes copy the
- * deepest nearby donor (mesh-warp look: background stretches across
- * the gap instead of blurring). The mip chain built afterwards
- * therefore averages to a validity-weighted local mean, which the
- * fill pass samples.
+ * valid pixels store (rgb, 1), disoccluded pixels (0,0,0,0) (black
+ * holes; the fill pass keeps them black).
  *
  * Warp math follows the OpenWarp family
  * (https://github.com/Zee2/openwarp, NCSA-licensed).
@@ -27,10 +23,6 @@ layout(set = 0, binding = 1) uniform PullUBO
 {
 	mat4 dstInv; // target clip -> world (inverse view * inverse projection, folded on CPU)
 	mat4 srcVP; // source projection * source view, folded on CPU
-	// x: background weight exponent (w = pow(depth, p)); 0 = uniform.
-	// y: stretch radius in px (0 = disabled); the hole search below
-	//    copies the deepest valid donor in a (2r+1)^2 window.
-	vec4 fillTune;
 } ubo;
 
 layout(set = 0, binding = 2, r32ui) uniform uimage2D splatDepth;
@@ -66,108 +58,21 @@ void main()
 		return;
 	vec2 tuv = (vec2(dstXY) + vec2(0.5)) / vec2(size);
 
-	vec2 suv = vec2(0.0);
-	bool ok = false;
-	float depth = 1.0;
-
-	// NOTE: bestDepth/bestXY/stretchR live at function scope, and the
-	// donor is re-verified against the stable splat image before use.
-	// Block-scope loop-carried state here loses its initializer on
-	// lavapipe (reads back stale slots), producing phantom donors that
-	// slip through the >= 0 guard; re-verification reduces every such
-	// failure to a safe blur fallback, and genuine donors always pass
-	// (same texel, same bits).
-	float bestDepth = -1.0;
-	ivec2 bestXY = ivec2(-1);
-	int stretchR = 0;
-
 	uint enc = imageLoad(splatDepth, dstXY).x;
-	if (enc != SPLAT_EMPTY) {
-		depth = float(enc) / DEPTH_SCALE;
-		if (sourceUV(tuv, depth, suv) && inBounds(suv))
-			ok = true;
+	if (enc == SPLAT_EMPTY) {
+		imageStore(dstColor, dstXY, vec4(0.0));
+		return;
 	}
-
-	// No hole search here by default: disoccluded pixels store
-	// premultiplied zero and the fill pass patches them with blur.
-	// With the stretch radius enabled, holes instead copy the deepest
-	// nearby donor: the background stretches across the gap the way
-	// the GL mesh warp's edge-snapped quads do, instead of smearing
-	// the foreground edge (which is what a nearest-valid search
-	// does). Holes wider than the window keep black and fall through
-	// to the blur fallback.
-	//
-	// NOTE: structured ifs only below (no continue/break): the donor
-	// result is re-verified against the splat image (see above), and
-	// texelFetch OOB is clamped.
-	if (!ok) {
-		float R = ubo.fillTune.y;
-		if (R >= 0.5) {
-			stretchR = int(R + 0.5);
-			bestDepth = -1.0;
-			bestXY = ivec2(-1);
-			for (int oy = -stretchR; oy <= stretchR; oy++) {
-				for (int ox = -stretchR; ox <= stretchR; ox++) {
-					ivec2 sxy = clamp(dstXY + ivec2(ox, oy), ivec2(0), size - ivec2(1));
-					uint e = imageLoad(splatDepth, sxy).x;
-					if (e != SPLAT_EMPTY) {
-						float d = float(e) / DEPTH_SCALE;
-						if (d > bestDepth) {
-							bestDepth = d;
-							bestXY = sxy;
-						}
-					}
-				}
-			}
-			if (bestDepth >= 0.0) {
-				// Re-verify the winner against the stable image: the loop
-				// result must match a fresh load of the same texel, or it
-				// is stale compiler state rather than a donor. Genuine
-				// donors always match (same texel, same bits); failures
-				// fall through to the blur fill instead of storing black.
-				ivec2 vxy = clamp(bestXY, ivec2(0), size - ivec2(1));
-				uint ve = imageLoad(splatDepth, vxy).x;
-				if (ve != SPLAT_EMPTY) {
-					float vd = float(ve) / DEPTH_SCALE;
-					if (abs(vd - bestDepth) < 0.000001) {
-						// Fresh reprojection of the verified donor (no
-						// loop-carried UV survives to here).
-						vec2 dtuv = (vec2(vxy) + vec2(0.5)) / vec2(size);
-						vec4 clip = vec4(dtuv * 2.0 - 1.0, vd * 2.0 - 1.0, 1.0);
-						vec4 world = ubo.dstInv * clip;
-						vec4 srcClip = ubo.srcVP * world;
-						if (srcClip.w > 0.0) {
-							vec2 dsuv = (srcClip.xy / srcClip.w) * 0.5 + 0.5;
-							if (inBounds(dsuv)) {
-								ivec2 fetchXY =
-								    clamp(ivec2(dsuv * vec2(size)), ivec2(0),
-								          size - ivec2(1));
-								vec4 color = texelFetch(srcColor, fetchXY, 0);
-								float p = ubo.fillTune.x;
-								float w = (p <= 0.0) ?
-								    1.0 :
-								    pow(clamp(vd, 1e-6, 1.0), p);
-								imageStore(dstColor, dstXY,
-								          vec4(color.rgb * w, w));
-								return;
-							}
-						}
-					}
-				}
-			}
-		}
+	float depth = float(enc) / DEPTH_SCALE;
+	vec2 suv = vec2(0.0);
+	if (!sourceUV(tuv, depth, suv) || !inBounds(suv)) {
 		imageStore(dstColor, dstXY, vec4(0.0));
 		return;
 	}
 
-	// Background-weighted premultiplied output: the mip average is
-	// then biased toward deep pixels, so the occluding foreground
-	// stops smearing into disocclusions. p = 0 restores uniform.
 	// Explicit (zero) gradients: implicit-derivative texture() in
 	// compute is undefined for non-uniform UVs (seams at depth
 	// discontinuities); lod 0 keeps the linear filtering.
 	vec4 color = textureGrad(srcColor, suv, vec2(0.0), vec2(0.0));
-	float p = ubo.fillTune.x;
-	float w = (p <= 0.0) ? 1.0 : pow(clamp(depth, 1e-6, 1.0), p);
-	imageStore(dstColor, dstXY, vec4(color.rgb * w, w));
+	imageStore(dstColor, dstXY, vec4(color.rgb, 1.0));
 }

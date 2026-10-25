@@ -28,40 +28,20 @@ const char* OpenwarpApplication::VulkanFillName(VulkanFillMethod m)
 {
     switch (m) {
     case VulkanFillMethod::Off: return "Off (black)";
-    case VulkanFillMethod::MipChain: return "Mip-chain blur";
-    case VulkanFillMethod::DepthGuided: return "Depth-guided blur";
-    case VulkanFillMethod::Stretch: return "Background stretch";
-    case VulkanFillMethod::DirectionalMarch: return "Directional march";
-    case VulkanFillMethod::BgExtrapolate: return "BG extrapolate";
-    case VulkanFillMethod::BilateralGather: return "Bilateral gather";
     default: return "<unknown>";
     }
 }
 
 OpenwarpApplication::VulkanFillMethod OpenwarpApplication::VulkanFillByIndex(int i)
 {
-    switch (i) {
-    case 0: return VulkanFillMethod::Off;
-    case 1: return VulkanFillMethod::MipChain;
-    case 2: return VulkanFillMethod::DepthGuided;
-    case 3: return VulkanFillMethod::Stretch;
-    case 4: return VulkanFillMethod::DirectionalMarch;
-    case 5: return VulkanFillMethod::BgExtrapolate;
-    case 6: return VulkanFillMethod::BilateralGather;
-    default: return VulkanFillMethod::Off;
-    }
+    (void)i;
+    return VulkanFillMethod::Off;
 }
 
 int OpenwarpApplication::VulkanFillIndex(VulkanFillMethod m)
 {
     switch (m) {
     case VulkanFillMethod::Off: return 0;
-    case VulkanFillMethod::MipChain: return 1;
-    case VulkanFillMethod::DepthGuided: return 2;
-    case VulkanFillMethod::Stretch: return 3;
-    case VulkanFillMethod::DirectionalMarch: return 4;
-    case VulkanFillMethod::BgExtrapolate: return 5;
-    case VulkanFillMethod::BilateralGather: return 6;
     default: return 0;
     }
 }
@@ -78,32 +58,21 @@ void OpenwarpApplication::CycleVulkanFill(int dir)
 float OpenwarpApplication::VulkanFillHoleRadius() const
 {
     // Maps the fill selector onto the VulkanWarp::Warp() holeRadius
-    // knob (>0 builds/samples the mip chain, 0 leaves holes black).
-    // Fills that need the chain for fallback return >0 here; pure
-    // in-shader fills return 0 and branch in doVulkanMeshWarp().
+    // knob. Only Off exists, so holes always stay black; future fills
+    // return >0 here. HoleRadius stays plumbed so new methods slot in
+    // without touching the Warp() call.
     switch (vulkanFill) {
-    case VulkanFillMethod::Off: return 0.0f;
-    case VulkanFillMethod::MipChain: return 1.0f;
-    case VulkanFillMethod::DepthGuided: return 1.0f;
-    case VulkanFillMethod::Stretch: return 1.0f;
-    case VulkanFillMethod::DirectionalMarch: return 1.0f;
-    case VulkanFillMethod::BgExtrapolate: return 1.0f;
-    case VulkanFillMethod::BilateralGather: return 1.0f;
+    case VulkanFillMethod::Off:
     default: return 0.0f;
     }
 }
 
 int OpenwarpApplication::VulkanFillMode() const
 {
-    // Maps onto the warp_fill.comp fillMode push constant.
+    // Maps onto the warp_fill.comp fillMode push constant (switch point
+    // for future fills; only 0 = black is implemented).
     switch (vulkanFill) {
-    case VulkanFillMethod::DepthGuided: return 1;
-    case VulkanFillMethod::DirectionalMarch: return 2;
-    case VulkanFillMethod::BgExtrapolate: return 3;
-    case VulkanFillMethod::BilateralGather: return 4;
     case VulkanFillMethod::Off:
-    case VulkanFillMethod::MipChain:
-    case VulkanFillMethod::Stretch:
     default: return 0;
     }
 }
@@ -401,9 +370,10 @@ void OpenwarpApplication::drawGUI(){
         ImGui::End();
     }
 
-    // Vulkan-only window: replaces the raymarch-vs-mesh selector. One
-    // radio per fill method so methods can be A/B'd side by side; add
-    // new methods as new radios + their tuning widgets below.
+    // Vulkan-only window: lists the fill method radios (only Off while
+    // fills are stripped) so the switch infra stays live for the next
+    // fill. To add a fill: append a VulkanFillMethod value + its tuning
+    // widgets here.
     if (showVulkanFillConfig && isVulkan) {
         ImGui::SetNextWindowPos(ImVec2(0, 1024), ImGuiCond_Once, ImVec2(0.0f, 1.0f));
         ImGui::SetNextWindowSize(ImVec2(300, 250), ImGuiCond_Always);
@@ -416,28 +386,7 @@ void OpenwarpApplication::drawGUI(){
             if (ImGui::RadioButton(VulkanFillName(m), active))
                 vulkanFill = m;
         }
-        // Per-method tuning: only shown for fills that use it, so dead
-        // knobs never look live. The power weights every averaging
-        // fill (and stretch donor weights); the radius is stretch-only.
-        if (vulkanFill != VulkanFillMethod::Off) {
-            ImGui::Text("Fill background weight power");
-            ImGui::PushItemWidth(-1);
-            ImGui::SliderFloat("##vkfill", &vulkanFillPower, 0.0f, 3.0f);
-            ImGui::PopItemWidth();
-        }
-        if (vulkanFill == VulkanFillMethod::Stretch) {
-            ImGui::Text("Stretch radius (px)");
-            ImGui::PushItemWidth(-1);
-            ImGui::SliderInt("##vkstretch", &vulkanStretchRadius, 1, 8);
-            ImGui::PopItemWidth();
-        }
-        // Orthogonal to the method above: cached background texels are
-        // projected into holes before the fill pass, so they sit
-        // underneath Off/MipChain/DepthGuided/Stretch alike.
-        ImGui::Checkbox("Temporal BG cache (underneath)", &vulkanTemporalCache);
-        if (vulkanFill == VulkanFillMethod::Off) {
-            ImGui::TextWrapped("Fill has no tunable parameters.");
-        }
+        ImGui::TextWrapped("Fill has no tunable parameters.");
 
         ImGui::End();
     }
@@ -693,17 +642,14 @@ int OpenwarpApplication::doVulkanMeshWarp()
 
     // Dirty tracking: the source frame only changes when renderScene runs
     // (15 Hz). Re-upload then; re-warp when the source, the target pose,
-    // or any fill setting moved since the last warp. Fill settings MUST
-    // participate: otherwise switching method/power/radius/cache shows
-    // the stale image and every fill looks identical. Otherwise the
-    // previously presented frame is still correct — skip everything
-    // (this is what keeps an uncapped present loop from re-warping
-    // identical frames at 1000 Hz).
+    // or the fill setting moved since the last warp. The fill setting
+    // MUST participate: otherwise switching methods shows the stale
+    // image. Otherwise the previously presented frame is still correct
+    // — skip everything (this is what keeps an uncapped present loop
+    // from re-warping identical frames at 1000 Hz).
     bool poseMoved = !haveLastWarpPose || lastWarpPos != position || lastWarpQuat != orientation;
     bool freshSource = (renderSeq != lastWarpRenderSeq);
-    bool fillChanged = !lastWarpFillInit || vulkanFill != lastWarpFill ||
-        vulkanFillPower != lastWarpFillPower || vulkanStretchRadius != lastWarpStretchRadius ||
-        vulkanTemporalCache != lastWarpTemporalCache;
+    bool fillChanged = !lastWarpFillInit || vulkanFill != lastWarpFill;
     if(!poseMoved && !freshSource && !fillChanged) {
         vulkanStats.skips++;
         // Idle with nothing new: re-present the cached frame when the
@@ -789,14 +735,10 @@ int OpenwarpApplication::doVulkanMeshWarp()
     std::memcpy(dstProj, projection.data(), sizeof(dstProj));
 
     // Hole fill dispatch: Off maps to holeRadius 0 (honest black for
-    // A/B); averaging fills build/sample the mip chain. The old
-    // expanding-ring search grew with hole width and smeared edges.
+    // A/B). fillMode is the switch point for future fills.
     // Coverage is sampled (1/60 warps): same-submit copy, negligible cost.
     bool wantCoverage = (vulkanStats.warps % 60) == 0;
-    vulkanWarp->SetFillWeightPow(vulkanFillPower);
     vulkanWarp->SetFillMode(VulkanFillMode());
-    vulkanWarp->SetStretchRadius(vulkanFill == VulkanFillMethod::Stretch ? vulkanStretchRadius : 0);
-    vulkanWarp->SetTemporalCacheEnabled(vulkanTemporalCache);
     if(!vulkanWarp->Warp(srcPose, srcProj, dstPose, dstProj, VulkanFillHoleRadius(), vulkanOut,
                          wantCoverage)) {
         std::cerr << "[vulkan] Warp failed (" << vulkanWarp->LastError() << "); disabling."
@@ -809,9 +751,6 @@ int OpenwarpApplication::doVulkanMeshWarp()
     lastWarpPos = position;
     lastWarpQuat = orientation;
     lastWarpFill = vulkanFill;
-    lastWarpFillPower = vulkanFillPower;
-    lastWarpStretchRadius = vulkanStretchRadius;
-    lastWarpTemporalCache = vulkanTemporalCache;
     lastWarpFillInit = true;
     if(wantCoverage)
         vulkanStats.lastCoverage = vulkanWarp->LastCoverage();
