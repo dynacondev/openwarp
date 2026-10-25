@@ -1,7 +1,11 @@
 # ML hole-fill spike (feat/ml)
 
 Tiny blur-initialized fill net + ONNX export. Proves the runtime path
-before any training effort.
+before any training effort. Toolchain: **mise** (python 3.12 + uv) and
+**uv** (venv + packages). No system python/pip setup needed.
+
+Pinned versions: python 3.12 (mise) · torch 2.9.1 (+cpu / +cu126) ·
+onnx 1.23.2 · onnxscript 0.7.2 · onnxruntime(-gpu) 1.31.0 · opset 17.
 
 ## Layout
 
@@ -11,9 +15,12 @@ before any training effort.
   blur of warped RGB (depth/mask/prev taps zeroed for now).
 - `export_blur.py` — builds the net, exports `weights/fill_blur_init.onnx`
   (dynamic H/W, opset 17), verifies with onnxruntime: shape, finite range,
-  valid-pixel MAE vs reference box blur, CPU timing smoke.
+  valid-pixel MAE vs reference box blur, timing. `--ort cuda` selects the
+  CUDA provider for the GPU timing.
 - `weights/fill_blur_init.onnx` — generated artifact, committed so the 3060
   host can benchmark without exporting.
+- `requirements-cpu.txt` / `requirements-cu126.txt` — pinned stacks, one per
+  host. torch comes from the PyTorch wheel index, the rest from PyPI.
 
 ## Channels (6, one temporal)
 
@@ -30,28 +37,37 @@ so valid pixels stay bit-exact — enforced in-shader at integration time,
 
 ## Setup
 
-CPU-only host (this box):
 ```
-pip install --index-url https://download.pytorch.org/whl/cpu torch
-pip install -r ml/requirements.txt
-```
-
-3060 host (NVIDIA):
-```
-pip install --index-url https://download.pytorch.org/whl/cu121 torch
-pip install onnx onnxruntime-gpu numpy
+cd openwarp
+mise install        # python 3.12 + uv, from openwarp/mise.toml
+mise run setup-cpu  # this host (torch +cpu)
+mise run setup-cuda # 3060 host (torch +cu126, onnxruntime-gpu)
 ```
 
 ## Run
 
 ```
-cd openwarp
-python3 ml/export_blur.py
+mise run export                                   # 1280x1024, CPU EP
+ml/.venv/bin/python ml/export_blur.py --ort cuda  # 3060 host, CUDA EP timing
 ```
 
-Expected: `BLUR EXPORT: PASS`, plus a CPU timing line that is smoke only.
+Expected: `BLUR EXPORT: PASS` + MAE < 0.02 vs box blur. CPU timings here are
+smoke only (ARM, ~56 ms); the number that matters is CUDA EP / TensorRT on
+the 3060.
 
-## Real latency (3060 host)
+## 3060 host (Ubuntu 26) from scratch
+
+```
+sudo ubuntu-drivers autoinstall && sudo reboot
+nvidia-smi                                   # 3060 visible, CUDA 12.x
+curl https://mise.run | sh                   # then restart shell / activate mise
+git clone <repo> && cd xplane-reproject/openwarp
+git checkout feat/ml
+mise install && mise run setup-cuda
+ml/.venv/bin/python ml/export_blur.py --ort cuda
+```
+
+Optional TensorRT number (ships with TensorRT 10):
 
 ```
 trtexec --onnx=ml/weights/fill_blur_init.onnx --fp16 \
@@ -59,11 +75,8 @@ trtexec --onnx=ml/weights/fill_blur_init.onnx --fp16 \
 ```
 
 Target: whole fill (preprocess + infer + composite) comfortably under ~2 ms
-at half-res stereo. If fp16 TRT is <1 ms, there is headroom for the trained
+at half-res stereo. If fp16 lands <1 ms, there is headroom for the trained
 UNet (downsample levels + skips) that lands next.
-
-TensorRT needs a static or profiled shape: use the half-res stereo shape
-above (`2x6x1024x1280` for 2560×2048-ish eyes, adjust to exact eye size).
 
 ## Next steps (not in this commit)
 

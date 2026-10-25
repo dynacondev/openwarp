@@ -1,0 +1,18 @@
+# Openwarp dev tools: Python 3.12 (modern torch.onnx exporter is broken on
+# 3.14) + uv for package management. Overrides the workspace-root mise.toml
+# while inside openwarp/.
+[tools]
+python = "3.12"
+uv = "latest"
+
+[tasks.setup-cpu]
+description = "Create ml/.venv (py3.12) and install the CPU torch stack via uv"
+run = "uv venv ml/.venv --python 3.12 && uv pip install --python ml/.venv/bin/python -r ml/requirements-cpu.txt"
+
+[tasks.setup-cuda]
+description = "Create ml/.venv (py3.12) and install the CUDA (cu126) torch stack via uv - 3060 host"
+run = "uv venv ml/.venv --python 3.12 && uv pip install --python ml/.venv/bin/python -r ml/requirements-cu126.txt"
+
+[tasks.export]
+description = "Export blur-init ONNX + ORT-verify at 1280x1024 (custom flags: ml/.venv/bin/python ml/export_blur.py -- --ort cuda)"
+run = "ml/.venv/bin/python ml/export_blur.py"

@@ -34,6 +34,8 @@ def main() -> None:
     ap.add_argument("--h", type=int, default=1024)
     ap.add_argument("--w", type=int, default=1280)
     ap.add_argument("--opset", type=int, default=17)
+    ap.add_argument("--ort", default="cpu",
+                    help="ORT provider: 'cpu' or 'cuda' (3060 host)")
     args = ap.parse_args()
 
     torch.manual_seed(0)
@@ -55,10 +57,23 @@ def main() -> None:
         dynamic_axes={"input": {2: "H", 3: "W"}, "output": {2: "H", 3: "W"}},
         opset_version=args.opset,
         do_constant_folding=True,
-        dynamo=False,  # legacy TorchScript exporter: Dynamo path is broken on py3.14
     )
     onnx_model = onnx.load(args.out)
     onnx.checker.check_model(onnx_model)
+    # Dynamo exporter parks initializers in a .data sidecar; inline them so
+    # the artifact is a single self-contained file for trtexec / ORT.
+    for init in onnx_model.graph.initializer:
+        if init.data_location == onnx.TensorProto.EXTERNAL:
+            del init.external_data[:]
+            init.data_location = onnx.TensorProto.DEFAULT
+    onnx.save(onnx_model, args.out)
+    # onnx>=1.19 save() still emits a (redundant) `<name>.onnx.data` sidecar
+    # even with all tensors inline — the file is proven self-contained, drop it.
+    import os
+
+    redundant = args.out + ".data"
+    if os.path.exists(redundant):
+        os.remove(redundant)
     print(f"[export] wrote {args.out} "
           f"({len(onnx_model.SerializeToString()) / 1024:.1f} KiB), opset {args.opset}")
 
@@ -75,7 +90,9 @@ def main() -> None:
     x = np.concatenate([rgb_in, depth, mask, prev], axis=-1)
     x = np.transpose(x, (2, 0, 1))[None].astype(np.float32)
 
-    sess = ort.InferenceSession(args.out, providers=["CPUExecutionProvider"])
+    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if args.ort == "cuda" \
+        else ["CPUExecutionProvider"]
+    sess = ort.InferenceSession(args.out, providers=providers)
     out = sess.run(None, {"input": x})[0]
     assert out.shape == (1, 3, H, W), f"unexpected shape {out.shape}"
     assert np.all(np.isfinite(out)), "non-finite outputs"

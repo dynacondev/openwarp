@@ -42,5 +42,9 @@ output/
 # VS Code configs
 .vscode/
 
+# Python ml tooling
+ml/.venv/
+__pycache__/
+
 # Visual Studio metadata
 .vs/
