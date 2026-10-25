@@ -185,6 +185,21 @@ class Openwarp::OpenwarpApplication{
             double gpuCopyMs = 0.0;
             uint64_t gpuTimedWarps = 0;
             float lastCoverage = -1.0f;
+            // NN-fill (mode 1) split: Fill() wall + its internal stages
+            // (scan/build/infer/composite from VulkanNnFill::LastStats),
+            // summed per paced interval. cpu-warp above INCLUDES the fill;
+            // subtract nnFillMs for the pure GPU-warp + splat-download
+            // part (the splat plane rides the same submit, so its cost is
+            // not separable without touching the warp path).
+            uint64_t nnFills = 0;
+            uint64_t nnEarlyOuts = 0;
+            double nnFillMs = 0.0;
+            double nnScanMs = 0.0;
+            double nnBuildMs = 0.0;
+            double nnInferMs = 0.0;
+            double nnCompMs = 0.0;
+            double nnHoleFrac = 0.0;
+            std::string nnBackend;
         } vulkanStats;
         bool vulkanDepthLogged = false;
         uint64_t vulkanDumpCount = 0;

@@ -58,7 +58,17 @@ include_directories(include/imgui)
 # Header-only libraries
 include_directories(include/eigen)
 
-set(CMAKE_BUILD_TYPE Debug)
+# Build-type default: Release. The NN-fill CPU loops (downsample to
+# 1x6x512x512, bilinear upsample + hard-mask composite at 1024x1024) run
+# ~10x slower under -O0, which reads as "NN fill runs at 8fps" on a perf
+# host that silently stayed Debug. An explicit -DCMAKE_BUILD_TYPE=... (or
+# an existing cache value) still wins; this only fills in the unset case.
+# 3060 host configure line:
+#   cmake -B build -DCMAKE_BUILD_TYPE=Release   (fresh dir; or wipe build/)
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type (Release recommended: NN fill is ~10x slower in Debug)" FORCE)
+endif()
+message(STATUS "CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} (NN fill needs Release/O2; Debug logs a stderr warning at nn-fill init)")
 
 set_property(TARGET openwarp PROPERTY CXX_STANDARD 17)
 target_compile_options(openwarp PRIVATE -Wall)

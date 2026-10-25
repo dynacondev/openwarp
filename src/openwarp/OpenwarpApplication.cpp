@@ -581,6 +581,9 @@ bool OpenwarpApplication::EnsureNnFill()
         return false;
     }
     nnFillModelPath = picked;
+    vulkanStats.nnBackend = nnFill->BackendLabel();
+    std::cout << "[vulkan] nn-fill ready: backend=" << vulkanStats.nnBackend
+              << " weights=" << picked << std::endl;
     return true;
 }
 
@@ -810,9 +813,24 @@ int OpenwarpApplication::doVulkanMeshWarp()
         if(wantCoverage && splat.size() == px)
             splatPtr = splat.data();
         // Any failure keeps vulkanOut as the black-hole frame (logged
-        // inside VulkanNnFill); it can never paint garbage.
+        // inside VulkanNnFill); it can never paint garbage. Timed for the
+        // paced stats below; the stage split comes from LastStats().
+        double tNn0 = nowMs();
+        bool nnOk = false;
         if(EnsureNnFill())
-            nnFill->Fill(WIDTH, HEIGHT, vulkanOut, splatPtr);
+            nnOk = nnFill->Fill(WIDTH, HEIGHT, vulkanOut, splatPtr);
+        double tNn1 = nowMs();
+        vulkanStats.nnFillMs += (tNn1 - tNn0);
+        if(nnOk) {
+            const openwarp_vk::VulkanNnFill::FillStats& ns = nnFill->LastStats();
+            vulkanStats.nnFills++;
+            vulkanStats.nnEarlyOuts += ns.earlyOut ? 1 : 0;
+            vulkanStats.nnScanMs += ns.scanMs;
+            vulkanStats.nnBuildMs += ns.buildMs;
+            vulkanStats.nnInferMs += ns.inferMs;
+            vulkanStats.nnCompMs += ns.compositeMs;
+            vulkanStats.nnHoleFrac += ns.holeFrac;
+        }
     }
     vulkanStats.warps++;
     haveLastWarpPose = true;
@@ -933,13 +951,29 @@ int OpenwarpApplication::doVulkanMeshWarp()
             std::cout << " | gpu timestamps off";
         }
         std::cout << " | coverage=" << vulkanStats.lastCoverage
-                  << " | present-fps=" << presentationFramerate << std::endl;
+                  << " | present-fps=" << presentationFramerate;
+        if(vulkanStats.nnFills) {
+            uint64_t m = vulkanStats.nnFills;
+            std::cout << " | nn fills=" << m << " early=" << vulkanStats.nnEarlyOuts
+                      << " hole=" << (100.0 * vulkanStats.nnHoleFrac / m) << "%"
+                      << " fill=" << vulkanStats.nnFillMs / m
+                      << " (scan=" << vulkanStats.nnScanMs / m
+                      << " build=" << vulkanStats.nnBuildMs / m
+                      << " infer=" << vulkanStats.nnInferMs / m
+                      << " comp=" << vulkanStats.nnCompMs / m << ")"
+                      << " backend="
+                      << (vulkanStats.nnBackend.empty() ? "?" : vulkanStats.nnBackend);
+        }
+        std::cout << std::endl;
         vulkanStats.warps = vulkanStats.uploads = vulkanStats.skips = 0;
         vulkanStats.readbackMs = vulkanStats.uploadMs = vulkanStats.warpMs = vulkanStats.presentMs =
             0.0;
         vulkanStats.gpuSplatMs = vulkanStats.gpuPullMs = vulkanStats.gpuFillMs =
             vulkanStats.gpuCopyMs = 0.0;
         vulkanStats.gpuTimedWarps = 0;
+        vulkanStats.nnFills = vulkanStats.nnEarlyOuts = 0;
+        vulkanStats.nnFillMs = vulkanStats.nnScanMs = vulkanStats.nnBuildMs =
+            vulkanStats.nnInferMs = vulkanStats.nnCompMs = vulkanStats.nnHoleFrac = 0.0;
     }
     return 1;
 }

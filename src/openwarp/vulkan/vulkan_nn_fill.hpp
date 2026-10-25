@@ -22,6 +22,7 @@
 //
 // Part of the Openwarp project, NCSA licensed (see LICENSE).
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -55,6 +56,33 @@ public:
 	bool UsingMock() const { return useMock_; }
 	const std::string& ModelPath() const { return modelPath_; }
 	const std::string& LastError() const { return lastError_; }
+
+	// Per-warp timings from the last Fill() (ms, steady-clock deltas):
+	// scan = hole-mask pre-scan, build = downsample to 1x6x512x512 input,
+	// infer = RunInfer (ORT incl. any H2D/D2H, or mock box blur),
+	// composite = bilinear upsample + hard-mask composite. total = Fill
+	// wall time. holes/holeFrac = exact mask count. earlyOut = holes==0
+	// so infer+composite were skipped (frame passes through bit-exact,
+	// prev cache still advanced). Read via LastStats() for the app's
+	// paced log; VulkanNnFill also prints its own 1 s rolling summary.
+	struct FillStats {
+		double scanMs = 0.0;
+		double buildMs = 0.0;
+		double inferMs = 0.0;
+		double compositeMs = 0.0;
+		double totalMs = 0.0;
+		double holeFrac = 0.0;
+		uint64_t holes = 0;
+		bool earlyOut = false;
+	};
+	const FillStats& LastStats() const { return lastStats_; }
+	// "mock", or "ORT[cuda,cpu]" / "ORT[cpu]". Logged at Load and on
+	// every rolling summary so the 3060 host can confirm which backend
+	// actually ran there.
+	std::string BackendLabel() const;
+	// OPENWARP_NN_LOG=1 enables one line per warp (default 0 = rolling
+	// 1 s summary only).
+	static bool LogVerbose();
 
 	// Latches the black fallback: Available() goes false, stderr line.
 	// The caller keeps presenting the black-hole frame.
@@ -94,6 +122,27 @@ private:
 	bool useMock_ = true;
 	std::string modelPath_;
 	std::string lastError_;
+	FillStats lastStats_;
+	// Hot-path scratch (6.3 MiB + 3.1 MiB at kNet=512): allocated once,
+	// reused every warp so Fill never mallocs in the hot path. The old
+	// per-warp vectors (input/pred/full-res up plane) are gone; the
+	// composite now samples hole pixels directly from the pred planes.
+	std::vector<float> scratchInput_;
+	std::vector<float> scratchPred_;
+	// Rolling 1 s summary accumulators (reset each print).
+	uint64_t rollFills_ = 0;
+	uint64_t rollEarly_ = 0;
+	double rollScanMs_ = 0.0;
+	double rollBuildMs_ = 0.0;
+	double rollInferMs_ = 0.0;
+	double rollCompMs_ = 0.0;
+	double rollHole_ = 0.0;
+	std::chrono::steady_clock::time_point rollStart_{};
+	bool rollInit_ = false;
+	void RollAccumulate(const FillStats& s);
+	void RollMaybeLog();
+	std::string providers_ = "mock"; // ORT EP list when built with ORT
+	int ortThreads_ = 0; // intra-op pool size configured (ORT only)
 	// Last filled frame (full-res RGBA8) for the prev-luma channel.
 	std::vector<uint8_t> prevFilled_;
 	uint32_t prevW_ = 0;

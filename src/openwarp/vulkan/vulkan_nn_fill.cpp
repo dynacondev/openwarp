@@ -9,11 +9,14 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <thread>
 
 namespace openwarp_vk {
 
@@ -28,6 +31,31 @@ float Clamp01(float v)
 	if (v > 1.0f)
 		return 1.0f;
 	return v;
+}
+
+double NowMs()
+{
+	using clock = std::chrono::steady_clock;
+	return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch()).count();
+}
+
+// Single-pixel bilinear sample, edge-clamped. UpsampleBilinear and the
+// fused Fill composite both go through here so bytes agree exactly.
+float BilinearAt(const float* src, int sw, int sh, float fx, float fy)
+{
+	int x0 = (int)std::floor(fx);
+	float tx = fx - x0;
+	x0 = std::min(std::max(x0, 0), sw - 1);
+	int x1 = std::min(x0 + 1, sw - 1);
+	int y0 = (int)std::floor(fy);
+	float ty = fy - y0;
+	y0 = std::min(std::max(y0, 0), sh - 1);
+	int y1 = std::min(y0 + 1, sh - 1);
+	float v00 = src[(size_t)y0 * sw + x0];
+	float v10 = src[(size_t)y0 * sw + x1];
+	float v01 = src[(size_t)y1 * sw + x0];
+	float v11 = src[(size_t)y1 * sw + x1];
+	return (v00 * (1 - tx) + v10 * tx) * (1 - ty) + (v01 * (1 - tx) + v11 * tx) * ty;
 }
 
 } // namespace
@@ -73,6 +101,23 @@ bool VulkanNnFill::Load(const std::string& modelPath, std::string* error)
 	disabled_ = false;
 	modelPath_.clear();
 	lastError_.clear();
+	providers_ = "mock";
+	ortThreads_ = 0;
+#ifndef NDEBUG
+	// Loud by design: the NN-fill CPU loops (downsample/upsample/
+	// composite) run ~10x slower under -O0, which reads as "NN runs at
+	// 8fps" on a perf host that silently stayed Debug. Once per process.
+	{
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			std::cerr << "[nn-fill] WARNING: unoptimized Debug build (NDEBUG off): "
+			             "NN-fill CPU loops run ~10x slower. Reconfigure Release "
+			             "on perf hosts (see docs/nn-fill-3060-runbook.md)."
+			          << std::endl;
+		}
+	}
+#endif
 #ifdef OPENWARP_HAS_ORT
 	delete ort_;
 	ort_ = nullptr;
@@ -90,6 +135,36 @@ bool VulkanNnFill::Load(const std::string& modelPath, std::string* error)
 		ort_ = new OrtState();
 		Ort::SessionOptions opts;
 		opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+		opts.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+		opts.EnableMemPattern(); // keep the arena on: per-run allocs hurt
+		// Latency path: one inter-op stream, intra-op pool from env
+		// OPENWARP_NN_THREADS (default = core count). The net is ~8k
+		// params; oversubscription only adds scheduling jitter, so the
+		// knob stays visible and the chosen value is logged below.
+		unsigned hw = std::thread::hardware_concurrency();
+		if (hw == 0)
+			hw = 4;
+		unsigned threads = hw;
+		if (const char* te = std::getenv("OPENWARP_NN_THREADS"))
+			threads = (unsigned)std::max(1, std::atoi(te));
+		ortThreads_ = (int)threads;
+		opts.SetIntraOpNumThreads((int)threads);
+		opts.SetInterOpNumThreads(1);
+		// Prefer the CUDA EP when the linked ORT ships it (3060 host).
+		// CPU Ort::Values still work (ORT inserts the copies); when the
+		// build is CPU-only this throws and we fall through to CPU EP.
+		bool cudaEp = false;
+		try {
+			OrtCUDAProviderOptions cudaOpts{};
+			if (const char* de = std::getenv("OPENWARP_NN_CUDA_DEVICE"))
+				cudaOpts.device_id = std::atoi(de);
+			opts.AppendExecutionProvider_CUDA(cudaOpts);
+			cudaEp = true;
+		} catch (const Ort::Exception& e) {
+			std::cerr << "[nn-fill] CUDA EP unavailable (" << e.what()
+			          << "); using CPU EP." << std::endl;
+		}
+		providers_ = cudaEp ? "ORT[cuda,cpu]" : "ORT[cpu]";
 		ort_->session = Ort::Session(ort_->env, modelPath.c_str(), opts);
 		Ort::AllocatorWithDefaultOptions alloc;
 		if (ort_->session.GetInputCount() != 1 || ort_->session.GetOutputCount() != 1)
@@ -120,16 +195,70 @@ bool VulkanNnFill::Load(const std::string& modelPath, std::string* error)
 	}
 	useMock_ = false;
 	std::cout << "[nn-fill] ORT backend: " << modelPath << " (in=" << ort_->inputName
-	          << " out=" << ort_->outputName << ")" << std::endl;
+	          << " out=" << ort_->outputName << " providers=" << providers_
+	          << " threads=" << ortThreads_ << " io=1x6x" << kNet << "x" << kNet << "->1x3x"
+	          << kNet << "x" << kNet << ")" << std::endl;
 #else
 	useMock_ = true;
 	std::cout << "[nn-fill] mock backend (no ORT C++ at build time): " << modelPath
-	          << " (3x3 box blur of input RGB; plumbing + hard-mask composite are identical)"
+	          << " (providers=mock threads=n/a io=1x6x" << kNet << "x" << kNet << "->1x3x"
+	          << kNet << "x" << kNet
+	          << "; 3x3 box blur of input RGB; plumbing + hard-mask composite are identical)"
 	          << std::endl;
 #endif
 	loaded_ = true;
 	modelPath_ = modelPath;
 	return true;
+}
+
+std::string VulkanNnFill::BackendLabel() const
+{
+#ifdef OPENWARP_HAS_ORT
+	if (!useMock_)
+		return providers_;
+#endif
+	return "mock";
+}
+
+bool VulkanNnFill::LogVerbose()
+{
+	const char* e = std::getenv("OPENWARP_NN_LOG");
+	return e && std::atoi(e) >= 1;
+}
+
+void VulkanNnFill::RollAccumulate(const FillStats& s)
+{
+	if (!rollInit_) {
+		rollStart_ = std::chrono::steady_clock::now();
+		rollInit_ = true;
+	}
+	rollFills_++;
+	rollEarly_ += s.earlyOut ? 1 : 0;
+	rollScanMs_ += s.scanMs;
+	rollBuildMs_ += s.buildMs;
+	rollInferMs_ += s.inferMs;
+	rollCompMs_ += s.compositeMs;
+	rollHole_ += s.holeFrac;
+}
+
+void VulkanNnFill::RollMaybeLog()
+{
+	using clock = std::chrono::steady_clock;
+	double dt =
+	    std::chrono::duration<double, std::milli>(clock::now() - rollStart_).count();
+	if (dt < 1000.0)
+		return;
+	uint64_t n = rollFills_ ? rollFills_ : 1;
+	std::cout << "[nn-fill] summary: warps=" << rollFills_ << " early=" << rollEarly_
+	          << " hole=" << (100.0 * rollHole_ / n) << "%"
+	          << " | ms/warp scan=" << rollScanMs_ / n << " build=" << rollBuildMs_ / n
+	          << " infer=" << rollInferMs_ / n << " comp=" << rollCompMs_ / n << " total="
+	          << (rollScanMs_ + rollBuildMs_ + rollInferMs_ + rollCompMs_) / n
+	          << " | backend=" << BackendLabel() << " io=1x6x" << kNet << "x" << kNet
+	          << "->1x3x" << kNet << "x" << kNet << std::endl;
+	rollFills_ = rollEarly_ = 0;
+	rollScanMs_ = rollBuildMs_ = rollInferMs_ = rollCompMs_ = rollHole_ = 0.0;
+	rollStart_ = clock::now();
 }
 
 bool VulkanNnFill::RunInfer(const float* input6ch, float* pred3ch)
@@ -208,22 +337,9 @@ void VulkanNnFill::UpsampleBilinear(const float* src, int sw, int sh, float* dst
 {
 	for (int y = 0; y < dh; y++) {
 		float fy = (y + 0.5f) * sh / dh - 0.5f;
-		int y0 = (int)std::floor(fy);
-		float ty = fy - y0;
-		y0 = std::min(std::max(y0, 0), sh - 1);
-		int y1 = std::min(y0 + 1, sh - 1);
 		for (int x = 0; x < dw; x++) {
 			float fx = (x + 0.5f) * sw / dw - 0.5f;
-			int x0 = (int)std::floor(fx);
-			float tx = fx - x0;
-			x0 = std::min(std::max(x0, 0), sw - 1);
-			int x1 = std::min(x0 + 1, sw - 1);
-			float v00 = src[(size_t)y0 * sw + x0];
-			float v10 = src[(size_t)y0 * sw + x1];
-			float v01 = src[(size_t)y1 * sw + x0];
-			float v11 = src[(size_t)y1 * sw + x1];
-			dst[(size_t)y * dw + x] =
-			    (v00 * (1 - tx) + v10 * tx) * (1 - ty) + (v01 * (1 - tx) + v11 * tx) * ty;
+			dst[(size_t)y * dw + x] = BilinearAt(src, sw, sh, fx, fy);
 		}
 	}
 }
@@ -292,39 +408,102 @@ bool VulkanNnFill::Fill(uint32_t w, uint32_t h, std::vector<uint8_t>& rgba, cons
 		DisableToBlack("Fill: bad frame size");
 		return false;
 	}
+	const double t0 = NowMs();
+	const size_t px = (size_t)w * h;
+
+	// 1) Exact hole pre-scan: 1M cheap compares. Doubles as the hole-
+	// fraction stat and the early-out gate. This stays exact (not
+	// strided): an estimate could miss small holes and leave them black.
+	uint64_t holes = 0;
+	if (splat) {
+		for (size_t i = 0; i < px; i++)
+			holes += (splat[i] == kSplatEmpty) ? 1 : 0;
+	} else {
+		for (size_t i = 0; i < px; i++)
+			holes += (rgba[4 * i + 3] == 0) ? 1 : 0;
+	}
+	const double tScan = NowMs();
+
 	const uint8_t* prev = (prevFilled_.size() == rgba.size() && prevW_ == w && prevH_ == h)
 	                          ? prevFilled_.data()
 	                          : nullptr;
-	std::vector<float> input((size_t)kInCh * kNet * kNet);
-	BuildInput(w, h, rgba.data(), splat, prev, input.data());
-	std::vector<float> pred((size_t)kOutCh * kNet * kNet);
-	if (!RunInfer(input.data(), pred.data()))
-		return false; // already latched + logged; rgba untouched.
+	FillStats s;
+	s.holes = holes;
+	s.holeFrac = px ? (double)holes / (double)px : 0.0;
+	s.scanMs = tScan - t0;
 
-	// Upsample each predicted channel to full res, then hard-mask
-	// composite: holes take the clamped prediction, valid pixels pass
-	// through bit-exact (never smeared by the net).
-	std::vector<float> up((size_t)w * h);
-	for (int c = 0; c < kOutCh; c++) {
-		UpsampleBilinear(pred.data() + (size_t)c * kNet * kNet, kNet, kNet, up.data(), w, h);
-		for (uint32_t y = 0; y < h; y++) {
-			for (uint32_t x = 0; x < w; x++) {
-				size_t i = (size_t)y * w + x;
-				bool hole = splat ? (splat[i] == kSplatEmpty) : (rgba[4 * i + 3] == 0);
-				if (hole && c == 0) {
-					// First touch of this hole pixel: set alpha once.
-					rgba[4 * i + 3] = 255;
-				}
-				if (hole) {
-					float v = Clamp01(up[i]);
-					rgba[4 * i + c] = (uint8_t)(v * 255.0f + 0.5f);
-				}
+	if (holes == 0) {
+		// Early-out: nothing to fill, so the frame passes through
+		// bit-exact. The prev cache still advances (filled == input),
+		// exactly as if the net had run on a hole-free frame. Skips
+		// BuildInput + infer + composite entirely. The gate is exactly
+		// zero, not "~0": a small nonzero threshold would leave visible
+		// black specks and make output input-order-dependent.
+		s.earlyOut = true;
+		prevFilled_ = rgba;
+		prevW_ = w;
+		prevH_ = h;
+		s.totalMs = NowMs() - t0;
+		lastStats_ = s;
+		RollAccumulate(s);
+		RollMaybeLog();
+		if (LogVerbose())
+			std::cout << "[nn-fill] warp early-out (holes=0) scan=" << s.scanMs << "ms"
+			          << std::endl;
+		return true;
+	}
+
+	// Reused scratch (sizes change only with net/frame size): Fill never
+	// mallocs in the hot path anymore (the old per-warp input/pred/up
+	// vectors did three big allocations per warp).
+	const size_t inCount = (size_t)kInCh * kNet * kNet;
+	const size_t outCount = (size_t)kOutCh * kNet * kNet;
+	if (scratchInput_.size() != inCount)
+		scratchInput_.resize(inCount);
+	if (scratchPred_.size() != outCount)
+		scratchPred_.resize(outCount);
+	BuildInput(w, h, rgba.data(), splat, prev, scratchInput_.data());
+	const double tBuild = NowMs();
+	if (!RunInfer(scratchInput_.data(), scratchPred_.data()))
+		return false; // already latched + logged; rgba untouched.
+	const double tInfer = NowMs();
+
+	// Fused upsample+composite, one pass: only hole pixels sample the 3
+	// pred planes (same BilinearAt formula as UpsampleBilinear, so bytes
+	// are identical to the old 3-plane path). Valid pixels pass through
+	// bit-exact, never smeared by the net.
+	for (uint32_t y = 0; y < h; y++) {
+		float fy = (y + 0.5f) * kNet / h - 0.5f;
+		for (uint32_t x = 0; x < w; x++) {
+			size_t i = (size_t)y * w + x;
+			bool hole = splat ? (splat[i] == kSplatEmpty) : (rgba[4 * i + 3] == 0);
+			if (!hole)
+				continue;
+			float fx = (x + 0.5f) * kNet / w - 0.5f;
+			for (int c = 0; c < kOutCh; c++) {
+				const float* plane = scratchPred_.data() + (size_t)c * kNet * kNet;
+				float v = BilinearAt(plane, kNet, kNet, fx, fy);
+				rgba[4 * i + c] = (uint8_t)(Clamp01(v) * 255.0f + 0.5f);
 			}
+			rgba[4 * i + 3] = 255;
 		}
 	}
+	const double tComp = NowMs();
 	prevFilled_ = rgba;
 	prevW_ = w;
 	prevH_ = h;
+	s.buildMs = tBuild - tScan;
+	s.inferMs = tInfer - tBuild;
+	s.compositeMs = tComp - tInfer;
+	s.totalMs = tComp - t0;
+	lastStats_ = s;
+	RollAccumulate(s);
+	RollMaybeLog();
+	if (LogVerbose())
+		std::cout << "[nn-fill] warp scan=" << s.scanMs << "ms build=" << s.buildMs << "ms infer="
+		          << s.inferMs << "ms comp=" << s.compositeMs << "ms total=" << s.totalMs
+		          << "ms holes=" << s.holes << " (" << (100.0 * s.holeFrac)
+		          << "%) backend=" << BackendLabel() << std::endl;
 	return true;
 }
 
