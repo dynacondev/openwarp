@@ -67,15 +67,61 @@ def run_torch_cuda(model: TinyFillNet, x: np.ndarray, H: int, W: int) -> np.ndar
     return out
 
 
+def run_torch_inductor(model: TinyFillNet, x: np.ndarray, H: int, W: int) -> np.ndarray:
+    """Fused-kernel number: torch.compile(max-autotune) fp16, no new deps."""
+    model.cuda().half().eval()
+    xt = torch.from_numpy(x).cuda().half()
+    print("[inductor] compiling (one-time Triton autotune, may take minutes)...")
+    opt = torch.compile(model, mode="max-autotune")
+    with torch.no_grad():
+        for _ in range(3):
+            _ = opt(xt)
+        out = opt(xt).float().cpu().numpy()
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    n = 50
+    with torch.no_grad():
+        for _ in range(n):
+            _ = opt(xt)
+    torch.cuda.synchronize()
+    print(f"[inductor] fp16-fused: {(time.perf_counter() - t0) / n * 1000:.2f} "
+          f"ms/infer at {W}x{H}")
+    return out
+
+
+def run_ort_iobind(onnx_path: str, x: np.ndarray, H: int, W: int) -> np.ndarray:
+    """ORT CUDA EP with device-resident tensors: no per-run H2D/D2H copies."""
+    import onnxruntime as ort
+    ort.preload_dlls()
+    sess = ort.InferenceSession(onnx_path, providers=["CUDAExecutionProvider"])
+    if "CUDAExecutionProvider" not in sess.get_providers():
+        raise SystemExit("CUDAExecutionProvider unavailable — see --ort cuda notes.")
+    io = sess.io_binding()
+    io.bind_ortvalue_input("input", ort.OrtValue.ortvalue_from_numpy(x, "cuda", 0))
+    y = ort.OrtValue.ortvalue_from_numpy(np.empty((1, 3, H, W), np.float32), "cuda", 0)
+    io.bind_ortvalue_output("output", y)
+    for _ in range(5):
+        sess.run_with_iobinding(io)
+    t0 = time.perf_counter()
+    n = 50
+    for _ in range(n):
+        sess.run_with_iobinding(io)
+    print(f"[iobind] ORT-CUDA device-resident: "
+          f"{(time.perf_counter() - t0) / n * 1000:.2f} ms/infer at {W}x{H}")
+    return y.numpy()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="ml/weights/fill_blur_init.onnx")
     ap.add_argument("--h", type=int, default=1024)
     ap.add_argument("--w", type=int, default=1280)
     ap.add_argument("--opset", type=int, default=18)
-    ap.add_argument("--ort", default="cpu", choices=["cpu", "cuda", "torch"],
-                    help="'cpu': ORT CPU EP; 'cuda': ORT CUDA EP (3060 host); "
-                         "'torch': time torch CUDA directly, no ORT involved")
+    ap.add_argument("--ort", default="cpu", choices=["cpu", "cuda", "torch", "inductor", "iobind"],
+                    help="'cpu': ORT CPU EP; 'cuda': ORT CUDA EP (sync copies); "
+                         "'torch': torch CUDA eager fp32/fp16; "
+                         "'inductor': torch.compile fused fp16 (the number that matters); "
+                         "'iobind': ORT CUDA EP, device-resident tensors (no per-run copies)")
     args = ap.parse_args()
 
     torch.manual_seed(0)
@@ -130,13 +176,22 @@ def main() -> None:
     x = np.concatenate([rgb_in, depth, mask, prev], axis=-1)
     x = np.transpose(x, (2, 0, 1))[None].astype(np.float32)
 
-    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if args.ort == "cuda" \
+    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if args.ort in ("cuda", "iobind") \
         else ["CPUExecutionProvider"]
     if args.ort == "torch":
         # Immediate GPU number with no new deps: torch cu126 bundles its own
         # CUDA 12.6 user-space libs, so this works wherever the driver does.
         out = run_torch_cuda(model, x, H, W)
         tag = "torch-cuda"
+    elif args.ort == "inductor":
+        # Fused-kernel number: Triton kernels via torch.compile, no new deps
+        # (triton ships with the cu126 torch wheel on x86_64).
+        out = run_torch_inductor(model, x, H, W)
+        tag = "inductor"
+    elif args.ort == "iobind":
+        # ORT CUDA EP, device-resident tensors: upload once, no per-run copies.
+        out = run_ort_iobind(args.out, x, H, W)
+        tag = "iobind"
     else:
         import onnxruntime as ort
         if args.ort == "cuda":
@@ -157,11 +212,11 @@ def main() -> None:
     assert np.all(np.isfinite(out)), "non-finite outputs"
     print(f"[{tag}] output shape {out.shape}, range "
           f"[{out.min():.4f}, {out.max():.4f}]" +
-          (f", providers {sess.get_providers()}" if args.ort != "torch" else ""))
+          (f", providers {sess.get_providers()}" if args.ort in ("cpu", "cuda") else ""))
 
     check_blur_init(out, rgb_in, mask, tag)
 
-    if args.ort == "torch":
+    if args.ort in ("torch", "inductor", "iobind"):
         print("BLUR EXPORT: PASS")
         return
 
