@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # Idempotent dev build for openwarp.
 #
-#   ./build.sh                 # Release, auto-detect ORT, build all warp targets
+#   ./build.sh                 # Release, auto-detect ORT/Torch, build all warp targets
 #   ./build.sh --clean         # wipe build/ first (e.g. after toolchain changes)
 #   ./build.sh --debug         # -DCMAKE_BUILD_TYPE=Debug (NN fill ~10x slower)
 #   ./build.sh --ort-root DIR # explicit onnxruntime C++ release dir
 #   ONNXRUNTIME_ROOT=DIR ./build.sh   # same via environment
+#   ./build.sh --torch-root DIR # explicit unpacked libtorch dir
+#   TORCH_ROOT=DIR ./build.sh   # same via environment
 #
-# Re-running is safe: configure carries the cached ONNXRUNTIME_ROOT, and a
-# missing/invalid root simply falls back to the mock NN backend (never a
-# broken build). Use --clean if CMake ever complains about stale cache.
+# Re-running is safe: configure carries the cached ONNXRUNTIME_ROOT /
+# TORCH_ROOT, and a missing/invalid root simply falls back to the
+# ORT/mock NN backend (never a broken build). Use --clean if CMake ever
+# complains about stale cache.
 #
 # Hermetic CUDA runtime: when ORT C++ is enabled, build.sh symlinks the
 # pip-pinned NVIDIA libs (from the mise venv) next to the provider .so
@@ -20,14 +23,17 @@ cd "$(dirname "$0")"
 
 BUILD_TYPE="Release"
 ORT_ROOT="${ONNXRUNTIME_ROOT:-}"
+TORCH_ROOT="${TORCH_ROOT:-}"
 WIPE=0
 for arg in "$@"; do
 	case "$arg" in
 	--clean) WIPE=1 ;;
 	--debug) BUILD_TYPE="Debug" ;;
-	-h | --help) sed -n '2,12p' "$0"; exit 0 ;;
+	-h | --help) sed -n '2,14p' "$0"; exit 0 ;;
 	--ort-root) echo "usage: --ort-root DIR" >&2; exit 2 ;;
 	--ort-root=*) ORT_ROOT="${arg#--ort-root=}" ;;
+	--torch-root) echo "usage: --torch-root DIR" >&2; exit 2 ;;
+	--torch-root=*) TORCH_ROOT="${arg#--torch-root=}" ;;
 	*) echo "unknown arg: $arg (see header)" >&2; exit 2 ;;
 	esac
 done
@@ -63,11 +69,31 @@ if [ -n "$ORT_ROOT" ]; then
 	CMAKE_ARGS+=("-DONNXRUNTIME_ROOT=$ORT_ROOT")
 fi
 
+# LibTorch auto-detect (3060 host: unzip the libtorch zip into ~/opt).
+# Explicit --torch-root / env always wins. Unlike ORT, torch needs no
+# CUDA staging here: its bundled libs already carry $ORIGIN runpaths,
+# so NEVER copy/symlink anything into the libtorch dir.
+if [ -z "$TORCH_ROOT" ]; then
+	for cand in "$HOME"/opt/libtorch* /opt/libtorch*; do
+		if [ -f "$cand/share/cmake/Torch/TorchConfig.cmake" ]; then
+			TORCH_ROOT="$cand"
+			break
+		fi
+	done
+fi
+if [ -n "$TORCH_ROOT" ]; then
+	if [ ! -f "$TORCH_ROOT/share/cmake/Torch/TorchConfig.cmake" ]; then
+		echo "error: TORCH_ROOT=$TORCH_ROOT has no share/cmake/Torch/TorchConfig.cmake" >&2
+		exit 1
+	fi
+	CMAKE_ARGS+=("-DTORCH_ROOT=$TORCH_ROOT")
+fi
+
 cmake -B build "${CMAKE_ARGS[@]}" > build/cmake-configure.log 2>&1 || {
 	cat build/cmake-configure.log
 	exit 1
 }
-grep -E "CMAKE_BUILD_TYPE|onnxruntime C\+\+" build/cmake-configure.log || true
+grep -E "CMAKE_BUILD_TYPE|onnxruntime C\+\+|libtorch" build/cmake-configure.log || true
 cmake --build build --target openwarp_vulkan_shaders openwarp-vulkan-test openwarp
 
 # Hermetic CUDA runtime: the provider .so carries no RUNPATH, so its
@@ -124,6 +150,11 @@ echo "build type : $(grep CMAKE_BUILD_TYPE:STRING build/CMakeCache.txt | cut -d=
 if grep -q "ONNXRUNTIME_LIB:FILEPATH=.*libonnxruntime" build/CMakeCache.txt; then
 	echo "ORT C++    : $(grep ONNXRUNTIME_LIB:FILEPATH build/CMakeCache.txt | cut -d= -f2)"
 else
-	echo "ORT C++    : not found (NN fill uses mock backend)"
+	echo "ORT C++    : not found (NN fill uses Torch/mock backend)"
 fi
+TORCH_HIT="$(grep '^Torch_DIR:PATH=' build/CMakeCache.txt | cut -d= -f2 || true)"
+case "$TORCH_HIT" in
+"" | *NOTFOUND*) echo "Torch C++  : not found (NN fill uses ORT/mock backend)" ;;
+*) echo "Torch C++  : $TORCH_HIT" ;;
+esac
 git log --oneline -1

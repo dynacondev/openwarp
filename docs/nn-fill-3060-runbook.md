@@ -30,16 +30,36 @@ OPENWARP_NN_LOG=1 ./build/openwarp --vulkan
 only. Look for the state-change lines (printed once at init/fallback):
 
 ```
-[nn-fill] mock backend (no ORT C++ at build time): ... (providers=mock ...)   # CPU box blur, NOT the net
+[nn-fill] mock backend (no Torch/ORT C++ at build time): ... (providers=mock ...)   # CPU box blur, NOT the net
 [nn-fill] ORT backend: ... (providers=ORT[cpu] threads=8 ...)                 # real net, CPU EP
-[nn-fill] ORT backend: ... (providers=ORT[cuda,cpu] threads=8 ...)            # real net, CUDA EP  <- want this
-[nn-fill] CUDA EP unavailable (...); using CPU EP.                            # GPU ORT missing/broken -> CPU
+[nn-fill] ORT backend: ... (providers=ORT[cuda,cpu] threads=8 ...)            # real net, CUDA EP
+[nn-fill] Torch backend: ... (device=cuda threads=8 ...)                     # real net, TorchScript CUDA  <- want this
+[nn-fill] Torch backend: ... (device=cpu threads=8 ...)                      # real net, TorchScript CPU
+[nn-fill] Torch CUDA unavailable (...); using CPU.                            # libtorch CPU-only or no driver -> CPU
+[nn-fill] CUDA EP unavailable (...); using CPU EP.                            # GPU ORT missing/broken -> CPU (legacy path)
 [nn-fill] WARNING: unoptimized Debug build (NDEBUG off): ...                 # you are measuring -O0, stop
-[vulkan] nn-fill ready: backend=ORT[cuda,cpu] weights=ml/weights/fill_blur_init.onnx
+[vulkan] nn-fill ready: backend=TORCH[cuda,cpu] weights=ml/weights/fill_blur_init.pt
 ```
 
-If you see `providers=mock`, the C++ never linked ORT (§3). If you see the
-Debug WARNING, rebuild Release first (§2) — all other numbers are meaningless.
+Backend priority when several are compiled in (decided: torch's CUDA
+stacking works on the 3060 host — proven by the eager/inductor runs —
+while ORT's prebuilt CUDA EP keeps failing loader-side):
+
+| compiled in | files present | backend used |
+|-------------|---------------|--------------|
+| Torch (+ORT) | `.pt` (as-given or `.onnx`→swapped twin) | `TORCH[cuda,cpu]` / `TORCH[cpu]` |
+| Torch + ORT | only `.onnx` | `ORT[cuda,cpu]` / `ORT[cpu]` |
+| ORT only | `.onnx` (as-given or `.pt`→swapped twin) | `ORT[cuda,cpu]` / `ORT[cpu]` |
+| any | only the other twin | `mock` (loud line, still needs a file) |
+| none | either | `mock` |
+
+`Load` accepts either extension and probes the twin (`fill_blur_init.onnx`
+⇄ `fill_blur_init.pt`), so the caller layouts (env `OPENWARP_NN_MODEL`,
+build default, relative `ml/weights/` paths) need no changes.
+
+If you see `providers=mock`, neither C++ backend linked (§3/§3c). If you
+see the Debug WARNING, rebuild Release first (§2) — all other numbers are
+meaningless.
 
 Per-interval app line (`[vulkan] stats`, every ~2 s) now ends with:
 
@@ -73,6 +93,9 @@ Stale objects from a pre-fix build dir keep old flags — if in doubt, wipe
 `build/` and configure fresh.
 
 ## 3. Point at the ORT C++ tarball (else you benchmark the mock)
+
+(Torch preferred: if you follow §3c below, this section is legacy —
+both can stay compiled, Torch wins at runtime.)
 
 Python `onnxruntime` wheels ship no C++ headers/libs, so `OPENWARP_HAS_ORT`
 stays off until you unpack a release tarball, e.g.:
@@ -130,6 +153,66 @@ from the ORT lib dir → `LD_LIBRARY_PATH` → venv globs, logged with
 EP then fails. `libcuda.so.1` must come from the NVIDIA driver — no
 driver, no CUDA EP, loud CPU fallback.
 
+### 3c. TorchScript backend (preferred — replaces the ORT C++ path)
+
+Decision (do not relitigate): torch's CUDA stacking works reliably on
+the 3060 host (proven by the Python eager/inductor runs), while ORT's
+prebuilt CUDA EP keeps failing on loader issues. `VulkanNnFill` therefore
+tries Torch first (`OPENWARP_HAS_TORCH`, `TORCH_ROOT`), then ORT, then
+mock. ORT paths stay compiled when present — nothing is removed.
+
+Naming gotcha (verified 2026-10-25 with `curl -I`, redirect followed):
+2.9.1 has NO `libtorch-cxx11-abi-shared-with-deps-…` build (that infix
+404s — cxx11 ABI is now the only build, so the infix is gone). The exact
+working URL pattern is:
+
+```
+https://download.pytorch.org/libtorch/<flavor>/libtorch-shared-with-deps-2.9.1%2B<flavor>.zip
+```
+
+Availability + size (HEAD, final 200 after the R2 redirect):
+
+| flavor | URL suffix | size | use |
+|--------|-----------|------|-----|
+| `cu126` | `cu126/libtorch-shared-with-deps-2.9.1%2Bcu126.zip` | ~3.0 GiB | **want this** — matches the `requirements-cu126.txt` venv |
+| `cu128` | `cu128/libtorch-shared-with-deps-2.9.1%2Bcu128.zip` | ~3.6 GiB | fallback if cu126 ever lacks a build (libtorch bundles its own CUDA, venv version need not match) |
+| `cpu` | `cpu/libtorch-shared-with-deps-2.9.1%2Bcpu.zip` | ~172 MiB | CPU-only fallback / version-match check |
+
+TorchScript version match is strict: the `.pt` must be scripted by the
+SAME torch (2.9.1) as the libtorch that loads it — export on the 3060
+venv (§3c validation), never copy a `.pt` across torch versions.
+
+3060 setup (do NOT download on dev/ARM boxes — multi-GiB, and there is
+no official Linux-aarch64 libtorch zip anyway):
+
+```
+cd ~/opt
+curl -LO https://download.pytorch.org/libtorch/cu126/libtorch-shared-with-deps-2.9.1%2Bcu126.zip
+unzip -q libtorch-shared-with-deps-2.9.1%2Bcu126.zip   # yields ~/opt/libtorch/
+ml/.venv/bin/python ml/export_script.py                # writes ml/weights/fill_blur_init.pt, reload-checks it
+./build.sh --torch-root ~/opt/libtorch                 # or TORCH_ROOT=~/opt/libtorch
+```
+
+`build.sh` also auto-detects `~/opt/libtorch*` and `/opt/libtorch*`
+(`share/cmake/Torch/TorchConfig.cmake` must exist) and prints
+`Torch C++ : <dir>` in the summary. Configure must say `libtorch
+found - NN fill uses TorchScript (preferred over ORT when both link)`.
+No CUDA staging is done for torch (and none must be added): its bundled
+libs already carry `$ORIGIN` runpaths — do NOT copy/symlink anything
+into the libtorch dir.
+
+3060 validation (after the build):
+
+```
+ml/.venv/bin/python ml/export_script.py   # SCRIPT EXPORT: PASS, max-abs-diff vs eager 0
+./build/openwarp-vulkan-test              # still PASS (Torch absent here does not change its path)
+OPENWARP_NN_LOG=1 ./build/openwarp --vulkan   # press T to NN fill; want backend=TORCH[cuda,cpu]
+```
+
+Tuning knobs (same env pattern as ORT): `OPENWARP_NN_THREADS=N` (torch
+CPU thread pool, default = core count; logged at Load),
+`OPENWARP_NN_CUDA_DEVICE=0`. fp32 for now — fp16 is a follow-up.
+
 ## 4. Read the summary, map each stage to its budget
 
 | stage (`nn` split) | budget | over budget => |
@@ -147,7 +230,13 @@ still (hole-free frames skip infer entirely).
 ## 5. What was NOT changed
 
 - `vulkan_warp.cpp` is zero-diff: mode 0 (Off/black) is bit-identical.
-- `ml/`, `resources/`, `mise.toml`, test files untouched.
-- Fallback safety kept: any load/infer failure latches black (`DisableToBlack`),
-  never garbage; the early-out fires only on exactly-zero holes (a `~0`
-  threshold would leave black specks and order-dependent output).
+- Test files, `datasetgen/`, `data.py`, `mise.toml`, requirement files,
+  and the committed `ml/weights/fill_blur_init.onnx` are untouched.
+- Python delta is additive only: new `ml/export_script.py` (TorchScript
+  twin export + reload check) and an optional `--script` flag on
+  `ml/export_blur.py` that also saves the scripted twin (default
+  behavior unchanged).
+- Failure safety kept: any load/infer failure latches black
+  (`DisableToBlack`), never garbage; the early-out fires only on
+  exactly-zero holes (a `~0` threshold would leave black specks and
+  order-dependent output).

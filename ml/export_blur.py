@@ -126,6 +126,12 @@ def main() -> None:
     ap.add_argument("--w", type=int, default=512)
     ap.add_argument("--opset", type=int, default=18)
     ap.add_argument(
+        "--script",
+        default=None,
+        help="also save a TorchScript twin (torch.jit.script) to this path, "
+        "e.g. ml/weights/fill_blur_init.pt; default None = ONNX only",
+    )
+    ap.add_argument(
         "--ort",
         default="cpu",
         choices=["cpu", "cuda", "torch", "inductor", "iobind"],
@@ -176,6 +182,9 @@ def main() -> None:
         f"[export] wrote {args.out} "
         f"({len(onnx_model.SerializeToString()) / 1024:.1f} KiB), opset {args.opset}"
     )
+    if args.script:
+        torch.jit.script(model).save(args.script)
+        print(f"[export] wrote TorchScript twin {args.script}")
 
     # --- ORT verification with synthetic warp-like input ---
     import onnxruntime as ort

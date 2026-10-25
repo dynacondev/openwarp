@@ -6,6 +6,9 @@
 #ifdef OPENWARP_HAS_ORT
 #include <onnxruntime_cxx_api.h>
 #endif
+#ifdef OPENWARP_HAS_TORCH
+#include <torch/script.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -243,6 +246,13 @@ struct VulkanNnFill::OrtState {
 };
 #endif
 
+#ifdef OPENWARP_HAS_TORCH
+struct VulkanNnFill::TorchState {
+	torch::jit::Module module;
+	torch::Device device{torch::kCPU};
+};
+#endif
+
 VulkanNnFill::VulkanNnFill() = default;
 
 VulkanNnFill::~VulkanNnFill() = default;
@@ -270,6 +280,7 @@ bool VulkanNnFill::Load(const std::string& modelPath, std::string* error)
 	lastError_.clear();
 	providers_ = "mock";
 	ortThreads_ = 0;
+	torchThreads_ = 0;
 #ifndef NDEBUG
 	// Loud by design: the NN-fill CPU loops (downsample/upsample/
 	// composite) run ~10x slower under -O0, which reads as "NN runs at
@@ -288,113 +299,218 @@ bool VulkanNnFill::Load(const std::string& modelPath, std::string* error)
 #ifdef OPENWARP_HAS_ORT
 	ort_.reset();
 #endif
+#ifdef OPENWARP_HAS_TORCH
+	torch_.reset();
+#endif
 
-	std::ifstream f(modelPath, std::ios::binary | std::ios::ate);
-	if (!f)
+	// Twin resolution: a ".onnx" path also probes its ".pt" sibling for
+	// the Torch backend and vice versa, so every caller layout (env
+	// OPENWARP_NN_MODEL, build default, relative ml/weights paths) works
+	// with either backend compiled in. Unknown extensions try as-given.
+	std::string onnxPath = modelPath;
+	std::string ptPath = modelPath;
+	if (modelPath.size() > 5 && modelPath.compare(modelPath.size() - 5, 5, ".onnx") == 0) {
+		ptPath = modelPath.substr(0, modelPath.size() - 5) + ".pt";
+	} else if (modelPath.size() > 3 && modelPath.compare(modelPath.size() - 3, 3, ".pt") == 0) {
+		onnxPath = modelPath.substr(0, modelPath.size() - 3) + ".onnx";
+	}
+	auto fileBytes = [](const std::string& p) -> long {
+		if (p.empty())
+			return -1;
+		std::ifstream f(p, std::ios::binary | std::ios::ate);
+		if (!f)
+			return -1;
+		std::streamsize n = f.tellg();
+		return n < 0 ? -1 : (long)n;
+	};
+	long onnxBytes = fileBytes(onnxPath);
+	long ptBytes = fileBytes(ptPath);
+	if (onnxBytes < 0 && ptBytes < 0)
 		return Fail(error, "cannot open NN model: " + modelPath);
-	std::streamsize n = f.tellg();
-	if (n <= 0)
-		return Fail(error, "NN model is empty: " + modelPath);
+	std::string servedPath = modelPath;
+	bool served = false;
+
+#ifdef OPENWARP_HAS_TORCH
+	// Torch first: its CUDA stacking works on the 3060 host where ORT's
+	// prebuilt CUDA EP kept failing loader-side. fp32 for now (fp16 is a
+	// follow-up). The .to(kCPU) after forward is a blocking copy, so no
+	// explicit stream sync is needed before the memcpy below.
+	if (ptBytes >= 0) {
+		if (ptBytes == 0)
+			return Fail(error, "NN model is empty: " + ptPath);
+		try {
+			auto st = std::make_unique<TorchState>();
+			st->module = torch::jit::load(ptPath);
+			st->module.eval();
+			unsigned hw = std::thread::hardware_concurrency();
+			if (hw == 0)
+				hw = 4;
+			unsigned threads = hw;
+			if (const char* te = std::getenv("OPENWARP_NN_THREADS"))
+				threads = (unsigned)std::max(1, std::atoi(te));
+			torchThreads_ = (int)threads;
+			at::set_num_threads((int)threads);
+			at::set_num_interop_threads(1);
+			// Prefer CUDA when the linked LibTorch can actually move
+			// the module there: .to(cuda) throws cleanly (c10::Error)
+			// in CPU-only builds or without a driver, so this probes
+			// usability — no torch::cuda::* link symbols needed beyond
+			// core ATen, and a partial move is rolled back to CPU.
+			st->device = torch::Device(torch::kCPU);
+			bool useCuda = false;
+			try {
+				int ordinal = 0;
+				if (const char* de = std::getenv("OPENWARP_NN_CUDA_DEVICE"))
+					ordinal = std::max(0, std::atoi(de));
+				st->module.to(torch::Device(torch::kCUDA, ordinal));
+				st->device = torch::Device(torch::kCUDA, ordinal);
+				useCuda = true;
+			} catch (const std::exception& e) {
+				try {
+					st->module.to(torch::kCPU);
+				} catch (...) {
+				}
+				std::cerr << "[nn-fill] Torch CUDA unavailable (" << e.what()
+				          << "); using CPU." << std::endl;
+			}
+			torch_ = std::move(st);
+			served = true;
+			servedPath = ptPath;
+			useMock_ = false;
+			providers_ = useCuda ? "TORCH[cuda,cpu]" : "TORCH[cpu]";
+			std::cout << "[nn-fill] Torch backend: " << ptPath
+			          << " (device=" << (useCuda ? "cuda" : "cpu")
+			          << " threads=" << torchThreads_ << " io=1x6x" << kNet << "x"
+			          << kNet << "->1x3x" << kNet << "x" << kNet << ")" << std::endl;
+		} catch (const std::exception& e) {
+			torch_.reset();
+			return Fail(error, std::string("Torch session failed for ") + ptPath + ": " + e.what());
+		}
+	}
+#endif
 
 #ifdef OPENWARP_HAS_ORT
-	try {
-		ort_ = std::make_unique<OrtState>();
-		Ort::SessionOptions opts;
-		opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-		opts.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
-		opts.EnableMemPattern(); // keep the arena on: per-run allocs hurt
-		// Latency path: one inter-op stream, intra-op pool from env
-		// OPENWARP_NN_THREADS (default = core count). The net is ~8k
-		// params; oversubscription only adds scheduling jitter, so the
-		// knob stays visible and the chosen value is logged below.
-		unsigned hw = std::thread::hardware_concurrency();
-		if (hw == 0)
-			hw = 4;
-		unsigned threads = hw;
-		if (const char* te = std::getenv("OPENWARP_NN_THREADS"))
-			threads = (unsigned)std::max(1, std::atoi(te));
-		ortThreads_ = (int)threads;
-		opts.SetIntraOpNumThreads((int)threads);
-		opts.SetInterOpNumThreads(1);
-		// Prefer the CUDA EP when the linked ORT ships it (3060 host).
-		// CPU Ort::Values still work (ORT inserts the copies); when the
-		// build is CPU-only this throws and we fall through to CPU EP.
-		// Before that, preload the provider's DT_NEEDED CUDA libs by
-		// absolute path (RTLD_GLOBAL): the provider .so carries no
-		// RUNPATH, so a sanitized LD_LIBRARY_PATH breaks its load even
-		// when the files sit next to it or in the venv.
-		bool cudaEp = false;
-		std::vector<std::string> cudaDepsMissing = PreloadCudaDeps();
+	if (!served && onnxBytes >= 0) {
+		if (onnxBytes == 0)
+			return Fail(error, "NN model is empty: " + onnxPath);
 		try {
-			OrtCUDAProviderOptions cudaOpts{};
-			if (const char* de = std::getenv("OPENWARP_NN_CUDA_DEVICE"))
-				cudaOpts.device_id = std::atoi(de);
-			opts.AppendExecutionProvider_CUDA(cudaOpts);
-			cudaEp = true;
-		} catch (const Ort::Exception& e) {
-			std::cerr << "[nn-fill] CUDA EP unavailable (" << e.what()
-			          << "); using CPU EP." << std::endl;
-			for (const std::string& lib : cudaDepsMissing) {
-				std::string ortDir = OrtLibDir();
-				std::cerr << "[nn-fill] cuda-dep missing: " << lib
-				          << " (place/symlink it into "
-				          << (ortDir.empty() ? "<the dir holding libonnxruntime>"
-				                             : ortDir)
-				          << ", or export LD_LIBRARY_PATH=<venv>/nvidia/*/lib)"
-				          << std::endl;
+			ort_ = std::make_unique<OrtState>();
+			Ort::SessionOptions opts;
+			opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+			opts.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+			opts.EnableMemPattern(); // keep the arena on: per-run allocs hurt
+			// Latency path: one inter-op stream, intra-op pool from env
+			// OPENWARP_NN_THREADS (default = core count). The net is ~8k
+			// params; oversubscription only adds scheduling jitter, so the
+			// knob stays visible and the chosen value is logged below.
+			unsigned hw = std::thread::hardware_concurrency();
+			if (hw == 0)
+				hw = 4;
+			unsigned threads = hw;
+			if (const char* te = std::getenv("OPENWARP_NN_THREADS"))
+				threads = (unsigned)std::max(1, std::atoi(te));
+			ortThreads_ = (int)threads;
+			opts.SetIntraOpNumThreads((int)threads);
+			opts.SetInterOpNumThreads(1);
+			// Prefer the CUDA EP when the linked ORT ships it (3060 host).
+			// CPU Ort::Values still work (ORT inserts the copies); when the
+			// build is CPU-only this throws and we fall through to CPU EP.
+			// Before that, preload the provider's DT_NEEDED CUDA libs by
+			// absolute path (RTLD_GLOBAL): the provider .so carries no
+			// RUNPATH, so a sanitized LD_LIBRARY_PATH breaks its load even
+			// when the files sit next to it or in the venv.
+			bool cudaEp = false;
+			std::vector<std::string> cudaDepsMissing = PreloadCudaDeps();
+			try {
+				OrtCUDAProviderOptions cudaOpts{};
+				if (const char* de = std::getenv("OPENWARP_NN_CUDA_DEVICE"))
+					cudaOpts.device_id = std::atoi(de);
+				opts.AppendExecutionProvider_CUDA(cudaOpts);
+				cudaEp = true;
+			} catch (const Ort::Exception& e) {
+				std::cerr << "[nn-fill] CUDA EP unavailable (" << e.what()
+				          << "); using CPU EP." << std::endl;
+				for (const std::string& lib : cudaDepsMissing) {
+					std::string ortDir = OrtLibDir();
+					std::cerr << "[nn-fill] cuda-dep missing: " << lib
+					          << " (place/symlink it into "
+					          << (ortDir.empty() ? "<the dir holding libonnxruntime>"
+					                             : ortDir)
+					          << ", or export LD_LIBRARY_PATH=<venv>/nvidia/*/lib)"
+					          << std::endl;
+				}
 			}
+			providers_ = cudaEp ? "ORT[cuda,cpu]" : "ORT[cpu]";
+			ort_->session = Ort::Session(ort_->env, onnxPath.c_str(), opts);
+			Ort::AllocatorWithDefaultOptions alloc;
+			if (ort_->session.GetInputCount() != 1 || ort_->session.GetOutputCount() != 1)
+				throw std::runtime_error("expected 1 input / 1 output");
+			ort_->inputName = ort_->session.GetInputNameAllocated(0, alloc).get();
+			ort_->outputName = ort_->session.GetOutputNameAllocated(0, alloc).get();
+			Ort::TypeInfo inType = ort_->session.GetInputTypeInfo(0);
+			Ort::TypeInfo outType = ort_->session.GetOutputTypeInfo(0);
+			auto inShape = inType.GetTensorTypeAndShapeInfo().GetShape();
+			auto outShape = outType.GetTensorTypeAndShapeInfo().GetShape();
+			ONNXTensorElementDataType inEl =
+			    inType.GetTensorTypeAndShapeInfo().GetElementType();
+			ONNXTensorElementDataType outEl =
+			    outType.GetTensorTypeAndShapeInfo().GetElementType();
+			if (inShape.size() != 4 || inShape[0] != 1 || inShape[1] != kInCh)
+				throw std::runtime_error("input must be 1x6xHxW");
+			if (outShape.size() != 4 || outShape[0] != 1 || outShape[1] != kOutCh)
+				throw std::runtime_error("output must be 1x3xHxW");
+			// Spatial dims must be dynamic (-1) or exactly the net size.
+			// Rejecting a fixed-shape mismatch here (loud, at load) instead
+			// of throwing per-warp after ORT already allocated: RunInfer
+			// feeds exactly 1x6x512x512 and copies out exactly 1x3x512x512.
+			for (int i = 2; i < 4; i++) {
+				if ((inShape[i] != -1 && inShape[i] != kNet) ||
+				    (outShape[i] != -1 && outShape[i] != kNet))
+					throw std::runtime_error("model H/W must be dynamic or " +
+					                         std::to_string(kNet));
+			}
+			if (inEl != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+			    outEl != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+				throw std::runtime_error("input/output must be float32");
+			// H/W stay dynamic (export uses dynamic axes); only batch and
+			// channel extents are pinned above.
+		} catch (const std::exception& e) {
+			ort_.reset();
+			return Fail(error, std::string("ORT session failed for ") + onnxPath + ": " + e.what());
 		}
-		providers_ = cudaEp ? "ORT[cuda,cpu]" : "ORT[cpu]";
-		ort_->session = Ort::Session(ort_->env, modelPath.c_str(), opts);
-		Ort::AllocatorWithDefaultOptions alloc;
-		if (ort_->session.GetInputCount() != 1 || ort_->session.GetOutputCount() != 1)
-			throw std::runtime_error("expected 1 input / 1 output");
-		ort_->inputName = ort_->session.GetInputNameAllocated(0, alloc).get();
-		ort_->outputName = ort_->session.GetOutputNameAllocated(0, alloc).get();
-		Ort::TypeInfo inType = ort_->session.GetInputTypeInfo(0);
-		Ort::TypeInfo outType = ort_->session.GetOutputTypeInfo(0);
-		auto inShape = inType.GetTensorTypeAndShapeInfo().GetShape();
-		auto outShape = outType.GetTensorTypeAndShapeInfo().GetShape();
-		ONNXTensorElementDataType inEl =
-		    inType.GetTensorTypeAndShapeInfo().GetElementType();
-		ONNXTensorElementDataType outEl =
-		    outType.GetTensorTypeAndShapeInfo().GetElementType();
-		if (inShape.size() != 4 || inShape[0] != 1 || inShape[1] != kInCh)
-			throw std::runtime_error("input must be 1x6xHxW");
-		if (outShape.size() != 4 || outShape[0] != 1 || outShape[1] != kOutCh)
-			throw std::runtime_error("output must be 1x3xHxW");
-		// Spatial dims must be dynamic (-1) or exactly the net size.
-		// Rejecting a fixed-shape mismatch here (loud, at load) instead
-		// of throwing per-warp after ORT already allocated: RunInfer
-		// feeds exactly 1x6x512x512 and copies out exactly 1x3x512x512.
-		for (int i = 2; i < 4; i++) {
-			if ((inShape[i] != -1 && inShape[i] != kNet) ||
-			    (outShape[i] != -1 && outShape[i] != kNet))
-				throw std::runtime_error("model H/W must be dynamic or " +
-				                         std::to_string(kNet));
-		}
-		if (inEl != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
-		    outEl != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
-			throw std::runtime_error("input/output must be float32");
-		// H/W stay dynamic (export uses dynamic axes); only batch and
-		// channel extents are pinned above.
-	} catch (const std::exception& e) {
-		ort_.reset();
-		return Fail(error, std::string("ORT session failed for ") + modelPath + ": " + e.what());
-	}
-	useMock_ = false;
-	std::cout << "[nn-fill] ORT backend: " << modelPath << " (in=" << ort_->inputName
-	          << " out=" << ort_->outputName << " providers=" << providers_
-	          << " threads=" << ortThreads_ << " io=1x6x" << kNet << "x" << kNet << "->1x3x"
-	          << kNet << "x" << kNet << ")" << std::endl;
-#else
-	useMock_ = true;
-	std::cout << "[nn-fill] mock backend (no ORT C++ at build time): " << modelPath
-	          << " (providers=mock threads=n/a io=1x6x" << kNet << "x" << kNet << "->1x3x"
-	          << kNet << "x" << kNet
-	          << "; 3x3 box blur of input RGB; plumbing + hard-mask composite are identical)"
-	          << std::endl;
+		useMock_ = false;
+		served = true;
+		servedPath = onnxPath;
+		std::cout << "[nn-fill] ORT backend: " << onnxPath << " (in=" << ort_->inputName
+		          << " out=" << ort_->outputName << " providers=" << providers_
+		          << " threads=" << ortThreads_ << " io=1x6x" << kNet << "x" << kNet << "->1x3x"
+		          << kNet << "x" << kNet << ")" << std::endl;
+	} // if (!served && onnxBytes >= 0)
 #endif
+	if (!served) {
+		// Mock: no twin the compiled backends could serve (or no real
+		// backend compiled at all). The as-given file still had to be
+		// non-empty (a twin alone also satisfies the exists check
+		// above), so a missing/empty-weights deploy fails loudly
+		// instead of silently filling with the mock.
+		if (fileBytes(modelPath) == 0)
+			return Fail(error, "NN model is empty: " + modelPath);
+		useMock_ = true;
+#if defined(OPENWARP_HAS_TORCH) && defined(OPENWARP_HAS_ORT)
+		std::cout << "[nn-fill] mock backend (no .pt/.onnx twin usable by Torch/ORT): ";
+#elif defined(OPENWARP_HAS_TORCH)
+		std::cout << "[nn-fill] mock backend (no .pt twin for Torch): ";
+#elif defined(OPENWARP_HAS_ORT)
+		std::cout << "[nn-fill] mock backend (no .onnx twin for ORT): ";
+#else
+		std::cout << "[nn-fill] mock backend (no Torch/ORT C++ at build time): ";
+#endif
+		std::cout << modelPath
+		          << " (providers=mock threads=n/a io=1x6x" << kNet << "x" << kNet << "->1x3x"
+		          << kNet << "x" << kNet
+		          << "; 3x3 box blur of input RGB; plumbing + hard-mask composite are identical)"
+		          << std::endl;
+	}
 	// Hot-path buffers are sized once here (not per warp): steady-state
 	// Fill never reallocates, so no ORT Value can ever alias a buffer
 	// across a reallocation. bad_alloc surfaces as a clean load error.
@@ -405,12 +521,16 @@ bool VulkanNnFill::Load(const std::string& modelPath, std::string* error)
 		return Fail(error, std::string("NN scratch alloc failed: ") + e.what());
 	}
 	loaded_ = true;
-	modelPath_ = modelPath;
+	modelPath_ = servedPath;
 	return true;
 }
 
 std::string VulkanNnFill::BackendLabel() const
 {
+#ifdef OPENWARP_HAS_TORCH
+	if (torch_)
+		return providers_;
+#endif
 #ifdef OPENWARP_HAS_ORT
 	if (!useMock_)
 		return providers_;
@@ -467,48 +587,87 @@ bool VulkanNnFill::RunInfer(const float* input6ch, float* pred3ch)
 	}
 	const size_t inCount = (size_t)kInCh * kNet * kNet;
 	const size_t outCount = (size_t)kOutCh * kNet * kNet;
-#ifdef OPENWARP_HAS_ORT
-	try {
-		// The Values below alias the caller buffers in place (no copy):
-		// inTensor references input6ch until the end of the scope, the
-		// output Value owns its (arena) buffer until outs dies. Both die
-		// before the memcpy'd result is validated, and neither outlives
-		// this call — so Fill's scratch can never be reallocated from
-		// under a live Value (it is resized only before BuildInput, when
-		// no Value exists). The inner scope makes that lifetime explicit.
-		std::array<int64_t, 4> inShape{1, kInCh, kNet, kNet};
-		assert(inCount == (size_t)kInCh * kNet * kNet);
-		assert(outCount == (size_t)kOutCh * kNet * kNet);
-		{
-			Ort::Value inTensor = Ort::Value::CreateTensor<float>(
-			    ort_->mem, const_cast<float*>(input6ch), inCount, inShape.data(), 4);
-			const char* inNames[] = {ort_->inputName.c_str()};
-			const char* outNames[] = {ort_->outputName.c_str()};
-			std::vector<Ort::Value> outs = ort_->session.Run(Ort::RunOptions{nullptr},
-			                                                 inNames, &inTensor, 1,
-			                                                 outNames, 1);
-			if (outs.size() != 1)
-				throw std::runtime_error("ORT returned != 1 output tensor");
-			Ort::Value& o = outs[0];
-			if (!o.IsTensor())
-				throw std::runtime_error("output is not a tensor");
-			auto info = o.GetTensorTypeAndShapeInfo();
-			if (info.GetElementCount() != outCount)
+#ifdef OPENWARP_HAS_TORCH
+	if (torch_) {
+		try {
+			// from_blob aliases input6ch in place (no copy on CPU; a
+			// staging copy on CUDA via the .to below). The device
+			// tensor and the outputs all die at scope end, before the
+			// memcpy'd result is validated — the same aliasing contract
+			// as the ORT Value path. The .to(kCPU) is a blocking copy,
+			// so no explicit stream sync is needed before data_ptr().
+			// InferenceMode (not just NoGrad): no autograd bookkeeping.
+			c10::InferenceMode guard;
+			torch::Tensor input =
+			    torch::from_blob(const_cast<float*>(input6ch),
+			                     {1, kInCh, kNet, kNet}, torch::kFloat32)
+			        .to(torch_->device);
+			torch::Tensor out = torch_->module.forward({input})
+			                        .toTensor()
+			                        .to(torch::kCPU, torch::kFloat32, false)
+			                        .contiguous();
+			if (out.numel() != (int64_t)outCount)
 				throw std::runtime_error("output element count mismatch");
-			const float* src = o.GetTensorData<float>();
+			const float* src = out.data_ptr<float>();
 			if (!src)
 				throw std::runtime_error("null output tensor data");
 			std::memcpy(pred3ch, src, outCount * sizeof(float));
-		} // inTensor + outs die here: no live alias remains past this point.
-		for (size_t i = 0; i < outCount; i++) {
-			if (!std::isfinite(pred3ch[i]))
-				throw std::runtime_error("non-finite network output");
+			for (size_t i = 0; i < outCount; i++) {
+				if (!std::isfinite(pred3ch[i]))
+					throw std::runtime_error("non-finite network output");
+			}
+		} catch (const std::exception& e) {
+			DisableToBlack(std::string("torch infer failed: ") + e.what());
+			return false;
 		}
-	} catch (const std::exception& e) {
-		DisableToBlack(std::string("infer failed: ") + e.what());
-		return false;
+		return true;
 	}
-#else
+#endif
+#ifdef OPENWARP_HAS_ORT
+	if (ort_) {
+		try {
+			// The Values below alias the caller buffers in place (no copy):
+			// inTensor references input6ch until the end of the scope, the
+			// output Value owns its (arena) buffer until outs dies. Both die
+			// before the memcpy'd result is validated, and neither outlives
+			// this call — so Fill's scratch can never be reallocated from
+			// under a live Value (it is resized only before BuildInput, when
+			// no Value exists). The inner scope makes that lifetime explicit.
+			std::array<int64_t, 4> inShape{1, kInCh, kNet, kNet};
+			assert(inCount == (size_t)kInCh * kNet * kNet);
+			assert(outCount == (size_t)kOutCh * kNet * kNet);
+			{
+				Ort::Value inTensor = Ort::Value::CreateTensor<float>(
+				    ort_->mem, const_cast<float*>(input6ch), inCount, inShape.data(), 4);
+				const char* inNames[] = {ort_->inputName.c_str()};
+				const char* outNames[] = {ort_->outputName.c_str()};
+				std::vector<Ort::Value> outs =
+				    ort_->session.Run(Ort::RunOptions{nullptr}, inNames, &inTensor, 1,
+				                      outNames, 1);
+				if (outs.size() != 1)
+					throw std::runtime_error("ORT returned != 1 output tensor");
+				Ort::Value& o = outs[0];
+				if (!o.IsTensor())
+					throw std::runtime_error("output is not a tensor");
+				auto info = o.GetTensorTypeAndShapeInfo();
+				if (info.GetElementCount() != outCount)
+					throw std::runtime_error("output element count mismatch");
+				const float* src = o.GetTensorData<float>();
+				if (!src)
+					throw std::runtime_error("null output tensor data");
+				std::memcpy(pred3ch, src, outCount * sizeof(float));
+			} // inTensor + outs die here: no live alias remains past this point.
+			for (size_t i = 0; i < outCount; i++) {
+				if (!std::isfinite(pred3ch[i]))
+					throw std::runtime_error("non-finite network output");
+			}
+		} catch (const std::exception& e) {
+			DisableToBlack(std::string("infer failed: ") + e.what());
+			return false;
+		}
+		return true;
+	} // if (ort_)
+#endif
 	// Mock session: per-channel 3x3 box blur of input RGB (ch 0..2).
 	// The blur-init weights compute gate(2) * box blur through identity
 	// body/head stages, so this matches up to kGateScale; verification
@@ -516,7 +675,6 @@ bool VulkanNnFill::RunInfer(const float* input6ch, float* pred3ch)
 	BoxBlur3x3(input6ch, pred3ch, kNet, kNet, kOutCh);
 	(void)inCount;
 	(void)outCount;
-#endif
 	return true;
 }
 

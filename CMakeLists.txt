@@ -171,6 +171,28 @@ if(OPENWARP_ENABLE_VULKAN)
             else()
                 message(STATUS "onnxruntime C++ not found - NN fill uses mock box-blur backend")
             endif()
+            # LibTorch C++ (optional, preferred over ORT when both are
+            # present: torch's CUDA stacking works on the 3060 host where
+            # ORT's prebuilt CUDA EP kept failing loader-side). Point
+            # TORCH_ROOT at an unpacked libtorch dir (it holds
+            # share/cmake/Torch/TorchConfig.cmake); without it (and without
+            # ORT) the build stays green with the mock backend. Libtorch
+            # bundles its own CUDA libs with $ORIGIN runpaths, so unlike
+            # ORT it needs no build.sh CUDA staging. Requires C++17, which
+            # this target already sets; no extra defines are added beyond
+            # what Torch itself demands.
+            set(TORCH_ROOT "" CACHE PATH "Prefix of an unpacked libtorch distribution (share/cmake/Torch/)")
+            if(TORCH_ROOT)
+                list(APPEND CMAKE_PREFIX_PATH "${TORCH_ROOT}")
+            endif()
+            find_package(Torch QUIET)
+            if(Torch_FOUND)
+                message(STATUS "libtorch found - NN fill uses TorchScript (preferred over ORT when both link)")
+                target_link_libraries(openwarp_vulkan PRIVATE ${TORCH_LIBRARIES})
+                target_compile_definitions(openwarp_vulkan PRIVATE OPENWARP_HAS_TORCH=1)
+            else()
+                message(STATUS "libtorch not found (TORCH_ROOT=${TORCH_ROOT}) - NN fill uses ORT/mock backend")
+            endif()
             set_property(TARGET openwarp_vulkan PROPERTY CXX_STANDARD 17)
             add_dependencies(openwarp_vulkan openwarp_vulkan_shaders)
             target_link_libraries(openwarp PRIVATE openwarp_vulkan)

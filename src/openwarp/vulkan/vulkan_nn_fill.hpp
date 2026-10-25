@@ -14,13 +14,16 @@
 // so reusing the scratch/prev buffers across warps is race-free by
 // construction (sequential reuse, never concurrent).
 //
-// Dependency-light: the ONNX Runtime C++ API is used only when
-// OPENWARP_HAS_ORT is set (CMake defines it when headers + lib are
-// found). Without ORT the backend is a mock session: a 3x3 box blur of
+// Dependency-light: the TorchScript C++ API (LibTorch) is used when
+// OPENWARP_HAS_TORCH is set (CMake defines it when find_package(Torch)
+// succeeds), the ONNX Runtime C++ API only when OPENWARP_HAS_ORT is set.
+// Backend priority when several are compiled in: Torch > ORT > mock.
+// Without either backend the session is a mock: a 3x3 box blur of
 // the input RGB channels. That matches the committed blur-init weights
-// up to the gate sigmoid(2)=0.881 scale (verification gate-compensates
-// exactly like ml/export_blur.py), so plumbing, shapes and the hard-mask
-// composite are proven identically with or without ORT.
+// up to the gate sigmoid(2)=0.881 scale factor, so verification
+// gate-compensates exactly like ml/export_blur.py, and plumbing, shapes
+// and the hard-mask composite are proven identically with or without
+// a real backend.
 //
 // Failure safety: any load/infer error latches disabled (Available() ==
 // false) with a stderr line; the caller keeps the black-hole frame, so a
@@ -53,20 +56,24 @@ public:
 	VulkanNnFill(const VulkanNnFill&) = delete;
 	VulkanNnFill& operator=(const VulkanNnFill&) = delete;
 
-	// Loads the ONNX model at modelPath. Even without ORT this requires
-	// the file to exist and be non-empty, so a missing-weights deploy
-	// fails loudly instead of silently filling with the mock. Returns
-	// false with the reason in *error (and LastError()) on failure.
+	// Loads the model at modelPath. Accepts either twin extension: a
+	// ".onnx" path also probes its ".pt" sibling for the Torch backend
+	// and vice versa (Torch > ORT > mock when several could serve the
+	// file). Even with no real backend this requires the file to exist
+	// and be non-empty, so a missing-weights deploy fails loudly instead
+	// of silently filling with the mock. Returns false with the reason
+	// in *error (and LastError()) on failure.
 	bool Load(const std::string& modelPath, std::string* error = nullptr);
 	bool Available() const { return loaded_ && !disabled_; }
-	// True when no ORT C++ was found at build time (mock backend).
+	// True when the mock backend serves: no real backend compiled in,
+	// or no usable .pt/.onnx twin found at Load.
 	bool UsingMock() const { return useMock_; }
 	const std::string& ModelPath() const { return modelPath_; }
 	const std::string& LastError() const { return lastError_; }
 
 	// Per-warp timings from the last Fill() (ms, steady-clock deltas):
 	// scan = hole-mask pre-scan, build = downsample to 1x6x512x512 input,
-	// infer = RunInfer (ORT incl. any H2D/D2H, or mock box blur),
+	// infer = RunInfer (Torch/ORT incl. any H2D/D2H, or mock box blur),
 	// composite = bilinear upsample + hard-mask composite. total = Fill
 	// wall time. holes/holeFrac = exact mask count. earlyOut = holes==0
 	// so infer+composite were skipped (frame passes through bit-exact,
@@ -83,9 +90,10 @@ public:
 		bool earlyOut = false;
 	};
 	const FillStats& LastStats() const { return lastStats_; }
-	// "mock", or "ORT[cuda,cpu]" / "ORT[cpu]". Logged at Load and on
-	// every rolling summary so the 3060 host can confirm which backend
-	// actually ran there.
+	// "mock", "ORT[cuda,cpu]" / "ORT[cpu]", or "TORCH[cuda,cpu]" /
+	// "TORCH[cpu]" when the Torch backend served the .pt twin. Logged at
+	// Load and on every rolling summary so the 3060 host can confirm
+	// which backend actually ran there.
 	std::string BackendLabel() const;
 	// OPENWARP_NN_LOG=1 enables one line per warp (default 0 = rolling
 	// 1 s summary only).
@@ -96,13 +104,13 @@ public:
 	void DisableToBlack(const std::string& why);
 
 	// One inference: input 1x6x512x512 NCHW float -> pred 1x3x512x512.
-	// ORT when built with it, else the mock box blur. False on error
-	// (latches disabled via DisableToBlack).
-	// Buffer contract: the ORT input Value references input6ch in place
-	// (no copy) for the duration of the call, so the caller must not
-	// resize, move or free either buffer until RunInfer returns. (Fill
-	// resizes its scratch only before any Value exists; RunInfer itself
-	// never reallocates.)
+	// Torch/ORT when built with them, else the mock box blur. False on
+	// error (latches disabled via DisableToBlack).
+	// Buffer contract: the ORT input Value / torch::from_blob tensor
+	// reference input6ch in place (no copy) for the duration of the call,
+	// so the caller must not resize, move or free either buffer until
+	// RunInfer returns. (Fill resizes its scratch only before any Value
+	// exists; RunInfer itself never reallocates.)
 	bool RunInfer(const float* input6ch, float* pred3ch);
 
 	// Full frame path: in-place fill of a w*h RGBA8 warp output whose
@@ -164,8 +172,9 @@ private:
 	bool rollInit_ = false;
 	void RollAccumulate(const FillStats& s);
 	void RollMaybeLog();
-	std::string providers_ = "mock"; // ORT EP list when built with ORT
+	std::string providers_ = "mock"; // active backend EP list (Torch/ORT)
 	int ortThreads_ = 0; // intra-op pool size configured (ORT only)
+	int torchThreads_ = 0; // CPU thread pool size configured (Torch only)
 	// Last filled frame (full-res RGBA8) for the prev-luma channel.
 	std::vector<uint8_t> prevFilled_;
 	uint32_t prevW_ = 0;
@@ -173,6 +182,10 @@ private:
 #ifdef OPENWARP_HAS_ORT
 	struct OrtState;
 	std::unique_ptr<OrtState> ort_; // RAII: session dies before env (see .cpp order)
+#endif
+#ifdef OPENWARP_HAS_TORCH
+	struct TorchState;
+	std::unique_ptr<TorchState> torch_; // RAII: module dies with us
 #endif
 };
 
