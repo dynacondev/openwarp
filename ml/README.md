@@ -50,7 +50,7 @@ mise run setup-cuda # 3060 host (torch +cu126, onnxruntime-gpu[cuda,cudnn])
 ## Run
 
 ```
-mise run export                                     # 1280x1024, CPU EP
+mise run export                                     # 512x512 (half of the 1024x1024 frame), CPU EP
 ml/.venv/bin/python ml/export_blur.py --ort torch   # 3060: torch CUDA fp32/fp16, no ORT
 ml/.venv/bin/python ml/export_blur.py --ort cuda    # 3060: ORT CUDA EP timing
 ```

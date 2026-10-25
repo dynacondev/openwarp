@@ -14,5 +14,5 @@ description = "Create ml/.venv (py3.12) and install the CUDA (cu126) torch stack
 run = "uv venv ml/.venv --python 3.12 && uv pip install --python ml/.venv/bin/python -r ml/requirements-cu126.txt"
 
 [tasks.export]
-description = "Export blur-init ONNX + ORT-verify at 1280x1024 (custom flags: ml/.venv/bin/python ml/export_blur.py -- --ort cuda)"
+description = "Export blur-init ONNX + ORT-verify at 512x512 (half of the 1024x1024 frame)"
 run = "ml/.venv/bin/python ml/export_blur.py"

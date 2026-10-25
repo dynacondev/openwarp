@@ -114,8 +114,8 @@ def run_ort_iobind(onnx_path: str, x: np.ndarray, H: int, W: int) -> np.ndarray:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="ml/weights/fill_blur_init.onnx")
-    ap.add_argument("--h", type=int, default=1024)
-    ap.add_argument("--w", type=int, default=1280)
+    ap.add_argument("--h", type=int, default=512)
+    ap.add_argument("--w", type=int, default=512)
     ap.add_argument("--opset", type=int, default=18)
     ap.add_argument("--ort", default="cpu", choices=["cpu", "cuda", "torch", "inductor", "iobind"],
                     help="'cpu': ORT CPU EP; 'cuda': ORT CUDA EP (sync copies); "
