@@ -5,7 +5,9 @@ before any training effort. Toolchain: **mise** (python 3.12 + uv) and
 **uv** (venv + packages). No system python/pip setup needed.
 
 Pinned versions: python 3.12 (mise) · torch 2.9.1 (+cpu / +cu126) ·
-onnx 1.23.2 · onnxscript 0.7.2 · onnxruntime(-gpu) 1.31.0 · opset 17.
+onnx 1.23.2 · onnxscript 0.7.2 · onnxruntime 1.31.0 / onnxruntime-gpu 1.31.0
+(+`[cuda,cudnn]` extra pulls pip CUDA 13 + cuDNN 9, no system toolkit) ·
+opset 18.
 
 ## Layout
 
@@ -14,9 +16,10 @@ onnx 1.23.2 · onnxscript 0.7.2 · onnxruntime(-gpu) 1.31.0 · opset 17.
   `init_blur_weights()` hand-sets weights so the untrained net ≈ 3×3 box
   blur of warped RGB (depth/mask/prev taps zeroed for now).
 - `export_blur.py` — builds the net, exports `weights/fill_blur_init.onnx`
-  (dynamic H/W, opset 17), verifies with onnxruntime: shape, finite range,
+  (dynamic H/W, opset 18), verifies with onnxruntime: shape, finite range,
   valid-pixel MAE vs reference box blur, timing. `--ort cuda` selects the
-  CUDA provider for the GPU timing.
+  CUDA provider for the GPU timing; `--ort torch` times torch CUDA directly
+  (no ORT involved).
 - `weights/fill_blur_init.onnx` — generated artifact, committed so the 3060
   host can benchmark without exporting.
 - `requirements-cpu.txt` / `requirements-cu126.txt` — pinned stacks, one per
@@ -41,30 +44,40 @@ so valid pixels stay bit-exact — enforced in-shader at integration time,
 cd openwarp
 mise install        # python 3.12 + uv, from openwarp/mise.toml
 mise run setup-cpu  # this host (torch +cpu)
-mise run setup-cuda # 3060 host (torch +cu126, onnxruntime-gpu)
+mise run setup-cuda # 3060 host (torch +cu126, onnxruntime-gpu[cuda,cudnn])
 ```
 
 ## Run
 
 ```
-mise run export                                   # 1280x1024, CPU EP
-ml/.venv/bin/python ml/export_blur.py --ort cuda  # 3060 host, CUDA EP timing
+mise run export                                     # 1280x1024, CPU EP
+ml/.venv/bin/python ml/export_blur.py --ort torch   # 3060: torch CUDA fp32/fp16, no ORT
+ml/.venv/bin/python ml/export_blur.py --ort cuda    # 3060: ORT CUDA EP timing
 ```
 
 Expected: `BLUR EXPORT: PASS` + MAE < 0.02 vs box blur. CPU timings here are
-smoke only (ARM, ~56 ms); the number that matters is CUDA EP / TensorRT on
-the 3060.
+smoke only (ARM, ~50 ms); the numbers that matter are torch-CUDA and ORT-CUDA
+on the 3060.
 
 ## 3060 host (Ubuntu 26) from scratch
 
+The `libcublasLt.so.13` failure is version skew, not a broken install:
+ORT ≥1.27 GPU wheels need CUDA 13 + cuDNN 9, while torch cu126 bundles
+CUDA 12.6. The fix (already in `requirements-cu126.txt` + `export_blur.py`)
+is the documented ORT path: `onnxruntime-gpu[cuda,cudnn]` pip-installs
+CUDA 13 + cuDNN 9 wheels next to torch's cu12 ones, and the script calls
+`ort.preload_dlls()` so the CUDA EP loads with no system toolkit.
+
 ```
 sudo ubuntu-drivers autoinstall && sudo reboot
-nvidia-smi                                   # 3060 visible, CUDA 12.x
+nvidia-smi                                   # 3060 visible
 curl https://mise.run | sh                   # then restart shell / activate mise
 git clone <repo> && cd xplane-reproject/openwarp
 git checkout feat/ml
 mise install && mise run setup-cuda
-ml/.venv/bin/python ml/export_blur.py --ort cuda
+git pull                                     # pick up this fix on the 3060 clone
+ml/.venv/bin/python ml/export_blur.py --ort torch   # zero-new-deps GPU number first
+ml/.venv/bin/python ml/export_blur.py --ort cuda    # then the ORT CUDA EP number
 ```
 
 Optional TensorRT number (ships with TensorRT 10):

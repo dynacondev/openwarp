@@ -28,14 +28,51 @@ def reference_box_blur(rgb: np.ndarray) -> np.ndarray:
     return acc / 9.0
 
 
+def check_blur_init(out: np.ndarray, rgb_in: np.ndarray, mask: np.ndarray, tag: str) -> None:
+    """Model output on valid pixels ~= reference 3x3 box blur of input RGB."""
+    pred = np.transpose(out[0], (1, 2, 0))
+    ref = reference_box_blur(rgb_in)
+    valid = (mask[..., 0] < 0.5)
+    # Gate sigmoid(2)=0.881 attenuates; compare up to that scale factor.
+    scale = float(1.0 / (1.0 + np.exp(-2.0)))
+    mae = np.abs(pred[valid] / scale - ref[valid]).mean()
+    print(f"[{tag}] valid-pixel MAE vs box blur (gate-compensated): {mae:.5f}")
+    assert mae < 0.02, f"blur init diverged (mae={mae})"
+
+
+def run_torch_cuda(model: TinyFillNet, x: np.ndarray, H: int, W: int) -> np.ndarray:
+    """fp32 correctness + fp32/fp16 CUDA timing, zero ORT involvement."""
+    if not torch.cuda.is_available():
+        raise SystemExit("torch.cuda unavailable — check nvidia-smi on this host")
+    model.cuda().eval()
+    xt = torch.from_numpy(x).cuda()
+    with torch.no_grad():
+        out = model(xt).float().cpu().numpy()
+    for name, mod, inp in (("fp32", model, xt), ("fp16", model.half(), xt.half())):
+        with torch.no_grad():
+            for _ in range(10):
+                _ = mod(inp)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        n = 50
+        with torch.no_grad():
+            for _ in range(n):
+                _ = mod(inp)
+        torch.cuda.synchronize()
+        print(f"[torch-cuda] {name}: {(time.perf_counter() - t0) / n * 1000:.2f} "
+              f"ms/infer at {W}x{H}")
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="ml/weights/fill_blur_init.onnx")
     ap.add_argument("--h", type=int, default=1024)
     ap.add_argument("--w", type=int, default=1280)
-    ap.add_argument("--opset", type=int, default=17)
-    ap.add_argument("--ort", default="cpu",
-                    help="ORT provider: 'cpu' or 'cuda' (3060 host)")
+    ap.add_argument("--opset", type=int, default=18)
+    ap.add_argument("--ort", default="cpu", choices=["cpu", "cuda", "torch"],
+                    help="'cpu': ORT CPU EP; 'cuda': ORT CUDA EP (3060 host); "
+                         "'torch': time torch CUDA directly, no ORT involved")
     args = ap.parse_args()
 
     torch.manual_seed(0)
@@ -92,24 +129,41 @@ def main() -> None:
 
     providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if args.ort == "cuda" \
         else ["CPUExecutionProvider"]
-    sess = ort.InferenceSession(args.out, providers=providers)
-    out = sess.run(None, {"input": x})[0]
+    if args.ort == "torch":
+        # Immediate GPU number with no new deps: torch cu126 bundles its own
+        # CUDA 12.6 user-space libs, so this works wherever the driver does.
+        out = run_torch_cuda(model, x, H, W)
+        tag = "torch-cuda"
+    else:
+        import onnxruntime as ort
+        if args.ort == "cuda":
+            # Loads the pip-installed CUDA 13 / cuDNN 9 libs (nvidia-* wheels
+            # from onnxruntime-gpu[cuda,cudnn]) so the CUDA EP starts with no
+            # system toolkit. torch (imported above) preloads its own cu126
+            # libs; the two CUDA majors coexist in separate wheel dirs.
+            ort.preload_dlls()
+        sess = ort.InferenceSession(args.out, providers=providers)
+        if args.ort == "cuda" and "CUDAExecutionProvider" not in sess.get_providers():
+            raise SystemExit(
+                "CUDAExecutionProvider unavailable — check nvidia-smi (driver with "
+                "CUDA 13 support) and that setup-cuda installed "
+                "onnxruntime-gpu[cuda,cudnn], then re-run setup-cuda.")
+        out = sess.run(None, {"input": x})[0]
+        tag = "ort"
     assert out.shape == (1, 3, H, W), f"unexpected shape {out.shape}"
     assert np.all(np.isfinite(out)), "non-finite outputs"
-    print(f"[ort] output shape {out.shape}, range "
-          f"[{out.min():.4f}, {out.max():.4f}], providers {sess.get_providers()}")
+    print(f"[{tag}] output shape {out.shape}, range "
+          f"[{out.min():.4f}, {out.max():.4f}]" +
+          (f", providers {sess.get_providers()}" if args.ort != "torch" else ""))
 
-    # Blur-init check on valid pixels: model output ~= box blur of input RGB.
-    pred = np.transpose(out[0], (1, 2, 0))
-    ref = reference_box_blur(rgb_in)
-    valid = (mask[..., 0] < 0.5)
-    # Gate sigmoid(2)=0.881 attenuates; compare up to that scale factor.
-    scale = float(1.0 / (1.0 + np.exp(-2.0)))
-    mae = np.abs(pred[valid] / scale - ref[valid]).mean()
-    print(f"[ort] valid-pixel MAE vs box blur (gate-compensated): {mae:.5f}")
-    assert mae < 0.02, f"blur init diverged (mae={mae})"
+    check_blur_init(out, rgb_in, mask, tag)
 
-    # Timing smoke (NOT representative: ARM CPU, ORT CPU EP).
+    if args.ort == "torch":
+        print("BLUR EXPORT: PASS")
+        return
+
+    # Timing (CPU number here is smoke only; the GPU number that matters is
+    # measured on the 3060 host).
     for _ in range(5):
         sess.run(None, {"input": x})
     t0 = time.perf_counter()
@@ -117,7 +171,7 @@ def main() -> None:
     for _ in range(n):
         sess.run(None, {"input": x})
     ms = (time.perf_counter() - t0) / n * 1000
-    print(f"[ort] CPU smoke timing: {ms:.1f} ms/infer at {W}x{H} "
+    print(f"[ort] {args.ort.upper()} timing: {ms:.1f} ms/infer at {W}x{H} "
           f"(see README for 3060 TensorRT numbers)")
 
     print("BLUR EXPORT: PASS")
