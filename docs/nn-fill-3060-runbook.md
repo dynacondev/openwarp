@@ -80,10 +80,11 @@ stays off until you unpack a release tarball, e.g.:
 ```
 # CPU first (proves the backend switch + real-net infer cost):
 curl -LO https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz
-tar xzf onnxruntime-linux-x64-1.22.0.tgz -C /opt
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DONNXRUNTIME_ROOT=/opt/onnxruntime-linux-x64-1.22.0
-# GPU (CUDA EP): use the -gpu tarball + a matching CUDA/cuDNN, same -D flag.
-cmake --build build --target openwarp_vulkan_shaders openwarp-vulkan-test openwarp
+tar xzf onnxruntime-linux-x64-1.22.0.tgz -C ~/opt
+./build.sh --ort-root ~/opt/onnxruntime-linux-x64-1.22.0
+# GPU (CUDA EP): use the gpu_cuda13 tarball (matches the pinned 1.31
+# onnxruntime-gpu wheels), same script:
+./build.sh --ort-root ~/opt/onnxruntime-linux-x64-gpu_cuda13-1.31.0
 ```
 
 Configure must print `onnxruntime C++ found: ... - NN fill uses ORT`
