@@ -46,5 +46,10 @@ output/
 ml/.venv/
 __pycache__/
 
+# Hole-fill dataset outputs (ml/datasetgen/gen_dataset.py --out data)
+data/
+# Built datasetgen capture binary (rebuild via ml/datasetgen/README.md)
+ml/datasetgen/capture
+
 # Visual Studio metadata
 .vs/
