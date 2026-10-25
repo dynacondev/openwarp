@@ -48,16 +48,19 @@ def run_torch_cuda(model: TinyFillNet, x: np.ndarray, H: int, W: int) -> np.ndar
     xt = torch.from_numpy(x).cuda()
     with torch.no_grad():
         out = model(xt).float().cpu().numpy()
-    for name, mod, inp in (("fp32", model, xt), ("fp16", model.half(), xt.half())):
+    # fp32 first: model.half() is in-place, so halve only after fp32 is done.
+    for name, use_half in (("fp32", False), ("fp16", True)):
+        m = model.half() if use_half else model
+        inp = xt.half() if use_half else xt
         with torch.no_grad():
             for _ in range(10):
-                _ = mod(inp)
+                _ = m(inp)
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         n = 50
         with torch.no_grad():
             for _ in range(n):
-                _ = mod(inp)
+                _ = m(inp)
         torch.cuda.synchronize()
         print(f"[torch-cuda] {name}: {(time.perf_counter() - t0) / n * 1000:.2f} "
               f"ms/infer at {W}x{H}")
