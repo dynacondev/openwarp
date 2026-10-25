@@ -50,8 +50,8 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))  # openwarp/
-FULL = 1024          # render / warp resolution (OpenwarpApplication 1024x1024)
-HALF = 512           # net resolution
+FULL = 1024  # render / warp resolution (OpenwarpApplication 1024x1024)
+HALF = 512  # net resolution
 DEPTH_SCALE = 16777215.0
 SPLIT_EMPTY = 0xFFFFFFFF
 
@@ -65,15 +65,18 @@ ANCHOR_QUAT = np.array([0.0, _s, 0.0, _c], dtype=np.float64)  # xyzw
 
 # --- quaternion helpers (xyzw convention) -----------------------------------
 
+
 def qmul(a, b):
     ax, ay, az, aw = a
     bx, by, bz, bw = b
-    return np.array([
-        aw * bx + ax * bw + ay * bz - az * by,
-        aw * by - ax * bz + ay * bw + az * bx,
-        aw * bz + ax * by - ay * bx + az * bw,
-        aw * bw - ax * bx - ay * by - az * bz,
-    ])
+    return np.array(
+        [
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz,
+        ]
+    )
 
 
 def qconj(q):
@@ -102,12 +105,13 @@ def qfrom_euler_deg(rx, ry, rz):
 
 # --- candidate sampling ------------------------------------------------------
 
+
 def sample_candidate(rng, a):
     """Draw one candidate (anchor pose + warp/inter deltas). Returns (rec, ok,
     reason): rec holds everything for shots.json + meta; ok=False means an
     analytic (pre-render) gate rejected it."""
     rec = {}
-    rec["seq_seed"] = int(rng.integers(2 ** 63))
+    rec["seq_seed"] = int(rng.integers(2**63))
     anchor_pos = ANCHOR_POS + rng.uniform(-a.anchor_pos, a.anchor_pos)
     anchor_e = rng.uniform(-a.anchor_rot, a.anchor_rot)
     anchor_q = qnorm(qmul(ANCHOR_QUAT, qfrom_euler_deg(*anchor_e)))
@@ -117,10 +121,16 @@ def sample_candidate(rng, a):
     ri_raw = rng.uniform(-a.inter_rot, a.inter_rot)
     # Per-axis sign alignment: inter follows warp's direction with variance.
     # Deadband keeps the raw sign when the warp axis is ~zero.
-    ti = np.where(np.abs(tw) < 1e-9, ti_raw,
-                  np.copysign(np.abs(ti_raw), np.where(tw >= 0, 1.0, -1.0)))
-    ri = np.where(np.abs(rw) < 1e-9, ri_raw,
-                  np.copysign(np.abs(ri_raw), np.where(rw >= 0, 1.0, -1.0)))
+    ti = np.where(
+        np.abs(tw) < 1e-9,
+        ti_raw,
+        np.copysign(np.abs(ti_raw), np.where(tw >= 0, 1.0, -1.0)),
+    )
+    ri = np.where(
+        np.abs(rw) < 1e-9,
+        ri_raw,
+        np.copysign(np.abs(ri_raw), np.where(rw >= 0, 1.0, -1.0)),
+    )
 
     ntw, nti = float(np.linalg.norm(tw)), float(np.linalg.norm(ti))
     nrw, nri = float(np.linalg.norm(rw)), float(np.linalg.norm(ri))
@@ -145,26 +155,34 @@ def sample_candidate(rng, a):
     qm = qnorm(qmul(q1, qconj(dq_i)))
     pm = p1 - qrot(qm, ti)
 
-    rec.update({
-        "anchor_pos": [float(v) for v in anchor_pos],
-        "anchor_euler_deg": [float(v) for v in anchor_e],
-        "warp_t": [float(v) for v in tw],
-        "warp_r_deg": [float(v) for v in rw],
-        "inter_t": [float(v) for v in ti],
-        "inter_r_deg": [float(v) for v in ri],
-        "cos_trans": cos_t,
-        "cos_rot": cos_r,
-        "warp_trans_norm": ntw,
-        "inter_trans_norm": nti,
-        "warp_rot_norm": nrw,
-        "inter_rot_norm": nri,
-        "p0": {"pos": [float(v) for v in p0],
-               "quat": [float(v) for v in qnorm(q0)]},
-        "ptm1": {"pos": [float(v) for v in pm],
-                 "quat": [float(v) for v in qnorm(qm)]},
-        "pt": {"pos": [float(v) for v in p1],
-               "quat": [float(v) for v in qnorm(q1)]},
-    })
+    rec.update(
+        {
+            "anchor_pos": [float(v) for v in anchor_pos],
+            "anchor_euler_deg": [float(v) for v in anchor_e],
+            "warp_t": [float(v) for v in tw],
+            "warp_r_deg": [float(v) for v in rw],
+            "inter_t": [float(v) for v in ti],
+            "inter_r_deg": [float(v) for v in ri],
+            "cos_trans": cos_t,
+            "cos_rot": cos_r,
+            "warp_trans_norm": ntw,
+            "inter_trans_norm": nti,
+            "warp_rot_norm": nrw,
+            "inter_rot_norm": nri,
+            "p0": {
+                "pos": [float(v) for v in p0],
+                "quat": [float(v) for v in qnorm(q0)],
+            },
+            "ptm1": {
+                "pos": [float(v) for v in pm],
+                "quat": [float(v) for v in qnorm(qm)],
+            },
+            "pt": {
+                "pos": [float(v) for v in p1],
+                "quat": [float(v) for v in qnorm(q1)],
+            },
+        }
+    )
     return rec, True, ""
 
 
@@ -172,27 +190,49 @@ def sample_candidate(rng, a):
 
 CAND_RE = re.compile(
     r"CAND\s+(\d+)\s+hole=([0-9.eE+-]+)\s+splat_empty=([0-9.eE+-]+)\s+"
-    r"alpha_extra=([0-9.eE+-]+)\s+accepted=([01])")
+    r"alpha_extra=([0-9.eE+-]+)\s+accepted=([01])"
+)
 
 
 def run_capture(capture_bin, shots, rawdir, repodir, args):
     os.makedirs(rawdir, exist_ok=True)
     shots_path = os.path.join(rawdir, "shots.json")
-    payload = [{"cand": s["cand"], "p0": s["rec"]["p0"],
-                "ptm1": s["rec"]["ptm1"], "pt": s["rec"]["pt"]} for s in shots]
+    payload = [
+        {
+            "cand": s["cand"],
+            "p0": s["rec"]["p0"],
+            "ptm1": s["rec"]["ptm1"],
+            "pt": s["rec"]["pt"],
+        }
+        for s in shots
+    ]
     with open(shots_path, "w") as f:
         json.dump(payload, f)
-    cmd = [capture_bin, "--shots", shots_path, "--rawdir", rawdir,
-           "--spvdir", os.path.join(repodir, "build", "openwarp-shaders"),
-           "--resources", os.path.join(repodir, "resources"),
-           "--hole-min", str(args.hole_min), "--hole-max", str(args.hole_max),
-           "--width", str(FULL), "--height", str(FULL)]
+    cmd = [
+        capture_bin,
+        "--shots",
+        shots_path,
+        "--rawdir",
+        rawdir,
+        "--spvdir",
+        os.path.join(repodir, "build", "openwarp-shaders"),
+        "--resources",
+        os.path.join(repodir, "resources"),
+        "--hole-min",
+        str(args.hole_min),
+        "--hole-max",
+        str(args.hole_max),
+        "--width",
+        str(FULL),
+        "--height",
+        str(FULL),
+    ]
     env = dict(os.environ)
     if args.display:
         env["DISPLAY"] = args.display
     if "DISPLAY" not in env:
         sys.exit("error: DISPLAY is not set (need Xvfb for the hidden GL window)")
-    p = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    p = subprocess.run(cmd, check=False, capture_output=True, text=True, env=env)
     if p.returncode != 0:
         print(p.stdout[-4000:], file=sys.stderr)
         print(p.stderr[-4000:], file=sys.stderr)
@@ -220,14 +260,16 @@ def run_capture(capture_bin, shots, rawdir, repodir, args):
 
 # --- packaging (1024 -> 512) -------------------------------------------------
 
+
 def block_mean_u8(a):
     h, w, c = a.shape
-    return np.round(a.reshape(h // 2, 2, w // 2, 2, c).mean(axis=(1, 3))).astype(np.uint8)
+    return np.round(a.reshape(h // 2, 2, w // 2, 2, c).mean(axis=(1, 3))).astype(
+        np.uint8
+    )
 
 
 def package_seq(cand, rec, cap, rawdir, outdir, name):
     """Read raw 1024px bins, build 512px products, write 4 npz + return meta."""
-    px = FULL * FULL
     pre = os.path.join(rawdir, f"c{cand:06d}")
     src = np.fromfile(pre + "_src_rgba.bin", np.uint8).reshape(FULL, FULL, 4)
     src_d = np.fromfile(pre + "_src_depth.bin", np.float32).reshape(FULL, FULL)
@@ -253,17 +295,20 @@ def package_seq(cand, rec, cap, rawdir, outdir, name):
     warped_rgb = masked_block_mean(warp[..., :3].astype(np.float64), valid)
     warped_rgb = np.round(np.clip(warped_rgb, 0, 255)).astype(np.uint8)
 
-    d01 = np.where(splat == SPLIT_EMPTY, 0.0,
-                   splat.astype(np.float64) / DEPTH_SCALE)
+    d01 = np.where(splat == SPLIT_EMPTY, 0.0, splat.astype(np.float64) / DEPTH_SCALE)
     depth512 = masked_block_mean(d01[..., None], valid)[..., 0]
     depth_u16 = np.round(np.clip(depth512, 0, 1) * 65535).astype(np.uint16)
 
     mask512 = (hole1024.reshape(HALF, 2, HALF, 2).sum(axis=(1, 3)) > 0).astype(np.uint8)
 
-    luma = (0.299 * prev[..., 0].astype(np.float64) +
-            0.587 * prev[..., 1].astype(np.float64) +
-            0.114 * prev[..., 2].astype(np.float64))
-    prev512 = np.round(luma.reshape(HALF, 2, HALF, 2).mean(axis=(1, 3))).astype(np.uint8)
+    luma = (
+        0.299 * prev[..., 0].astype(np.float64)
+        + 0.587 * prev[..., 1].astype(np.float64)
+        + 0.114 * prev[..., 2].astype(np.float64)
+    )
+    prev512 = np.round(luma.reshape(HALF, 2, HALF, 2).mean(axis=(1, 3))).astype(
+        np.uint8
+    )
 
     src512 = block_mean_u8(src[..., :3].copy())
     tm1512 = block_mean_u8(tm1[..., :3].copy())
@@ -279,21 +324,35 @@ def package_seq(cand, rec, cap, rawdir, outdir, name):
     np.savez_compressed(os.path.join(outdir, f"{name}__src.npz"), rgb=src512)
     np.savez_compressed(os.path.join(outdir, f"{name}__true_tm1.npz"), rgb=tm1512)
     np.savez_compressed(os.path.join(outdir, f"{name}__true_t.npz"), rgb=t512)
-    np.savez_compressed(os.path.join(outdir, f"{name}__input_t.npz"),
-                        warped_rgb=warped_rgb, depth_u16=depth_u16,
-                        mask=mask512, prev=prev512)
+    np.savez_compressed(
+        os.path.join(outdir, f"{name}__input_t.npz"),
+        warped_rgb=warped_rgb,
+        depth_u16=depth_u16,
+        mask=mask512,
+        prev=prev512,
+    )
 
     meta = {
-        "seq": name, "cand": cand, "seq_seed": rec["seq_seed"],
+        "seq": name,
+        "cand": cand,
+        "seq_seed": rec["seq_seed"],
         "anchor_pos": rec["anchor_pos"],
         "anchor_euler_deg": rec["anchor_euler_deg"],
-        "warp_t": rec["warp_t"], "warp_r_deg": rec["warp_r_deg"],
-        "inter_t": rec["inter_t"], "inter_r_deg": rec["inter_r_deg"],
-        "cos_trans": rec["cos_trans"], "cos_rot": rec["cos_rot"],
-        "p0": rec["p0"], "ptm1": rec["ptm1"], "pt": rec["pt"],
-        "hole_frac": cap["hole"], "splat_empty_frac": cap["splat_empty"],
-        "alpha_extra_frac": cap["alpha_extra"], "hole_frac_512": hole512,
-        "src_depth_min": float(src_d.min()), "src_depth_max": float(src_d.max()),
+        "warp_t": rec["warp_t"],
+        "warp_r_deg": rec["warp_r_deg"],
+        "inter_t": rec["inter_t"],
+        "inter_r_deg": rec["inter_r_deg"],
+        "cos_trans": rec["cos_trans"],
+        "cos_rot": rec["cos_rot"],
+        "p0": rec["p0"],
+        "ptm1": rec["ptm1"],
+        "pt": rec["pt"],
+        "hole_frac": cap["hole"],
+        "splat_empty_frac": cap["splat_empty"],
+        "alpha_extra_frac": cap["alpha_extra"],
+        "hole_frac_512": hole512,
+        "src_depth_min": float(src_d.min()),
+        "src_depth_max": float(src_d.max()),
     }
     with open(os.path.join(outdir, f"{name}__meta.json"), "w") as f:
         json.dump(meta, f, sort_keys=True, indent=2)
@@ -303,6 +362,7 @@ def package_seq(cand, rec, cap, rawdir, outdir, name):
 
 # --- driver ------------------------------------------------------------------
 
+
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description="seeded hole-fill dataset generator")
     ap.add_argument("--out", default="data", help="output dir (default: data)")
@@ -311,23 +371,61 @@ def parse_args(argv=None):
     ap.add_argument("--val", type=int, default=200)
     ap.add_argument("--hole-min", type=float, default=0.02)
     ap.add_argument("--hole-max", type=float, default=0.15)
-    ap.add_argument("--min-cos", type=float, default=0.5,
-                    help="min cosine similarity warp-vs-inter delta (trans+rot)")
-    ap.add_argument("--anchor-pos", type=float, nargs=3, default=[0.4, 0.25, 0.4],
-                    help="anchor translation half-extent xyz (m)")
-    ap.add_argument("--anchor-rot", type=float, nargs=3, default=[4.0, 4.0, 4.0],
-                    help="anchor euler half-extent xyz (deg)")
-    ap.add_argument("--warp-pos", type=float, nargs=3, default=[0.10, 0.06, 0.10],
-                    help="warp delta translation half-extent xyz (m)")
-    ap.add_argument("--warp-rot", type=float, nargs=3, default=[1.5, 1.5, 1.5],
-                    help="warp delta euler half-extent xyz (deg)")
-    ap.add_argument("--inter-pos", type=float, nargs=3, default=[0.012, 0.008, 0.012],
-                    help="inter delta translation half-extent xyz (m)")
-    ap.add_argument("--inter-rot", type=float, nargs=3, default=[0.2, 0.2, 0.2],
-                    help="inter delta euler half-extent xyz (deg)")
+    ap.add_argument(
+        "--min-cos",
+        type=float,
+        default=0.5,
+        help="min cosine similarity warp-vs-inter delta (trans+rot)",
+    )
+    ap.add_argument(
+        "--anchor-pos",
+        type=float,
+        nargs=3,
+        default=[0.4, 0.25, 0.4],
+        help="anchor translation half-extent xyz (m)",
+    )
+    ap.add_argument(
+        "--anchor-rot",
+        type=float,
+        nargs=3,
+        default=[4.0, 4.0, 4.0],
+        help="anchor euler half-extent xyz (deg)",
+    )
+    ap.add_argument(
+        "--warp-pos",
+        type=float,
+        nargs=3,
+        default=[0.10, 0.06, 0.10],
+        help="warp delta translation half-extent xyz (m)",
+    )
+    ap.add_argument(
+        "--warp-rot",
+        type=float,
+        nargs=3,
+        default=[1.5, 1.5, 1.5],
+        help="warp delta euler half-extent xyz (deg)",
+    )
+    ap.add_argument(
+        "--inter-pos",
+        type=float,
+        nargs=3,
+        default=[0.012, 0.008, 0.012],
+        help="inter delta translation half-extent xyz (m)",
+    )
+    ap.add_argument(
+        "--inter-rot",
+        type=float,
+        nargs=3,
+        default=[0.2, 0.2, 0.2],
+        help="inter delta euler half-extent xyz (deg)",
+    )
     ap.add_argument("--batch", type=int, default=32, help="shots per capture call")
-    ap.add_argument("--max-factor", type=float, default=10.0,
-                    help="max candidates = factor * needed, else abort")
+    ap.add_argument(
+        "--max-factor",
+        type=float,
+        default=10.0,
+        help="max candidates = factor * needed, else abort",
+    )
     ap.add_argument("--keep-raw", action="store_true", help="keep 1024px raw bins")
     ap.add_argument("--display", default=None, help="X display (default: $DISPLAY)")
     ap.add_argument("--capture-bin", default=None)
@@ -336,10 +434,15 @@ def parse_args(argv=None):
 
 def git_commit(repodir):
     try:
-        p = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=repodir,
-                           capture_output=True, text=True)
+        p = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            check=False,
+            cwd=repodir,
+            capture_output=True,
+            text=True,
+        )
         return p.stdout.strip() or "unknown"
-    except Exception:
+    except OSError:
         return "unknown"
 
 
@@ -363,7 +466,8 @@ def main(argv=None):
             "-Isrc/openwarp ml/datasetgen/capture.cpp src/openwarp/util/obj.cpp "
             "build/libopenwarp_vulkan.a build/lib/libglewd.a "
             "build/include/glfw/src/libglfw3.a -lvulkan -lGL -lX11 -lXext "
-            "-ldl -lm -lpthread -o ml/datasetgen/capture")
+            "-ldl -lm -lpthread -o ml/datasetgen/capture"
+        )
     os.makedirs(outdir, exist_ok=True)
     if os.path.exists(rawdir):
         shutil.rmtree(rawdir)
@@ -374,7 +478,8 @@ def main(argv=None):
         "seed": a.seed,
         "counts": {"train": a.train, "val": a.val},
         "flags": {
-            "hole_min": a.hole_min, "hole_max": a.hole_max,
+            "hole_min": a.hole_min,
+            "hole_max": a.hole_max,
             "min_cos": a.min_cos,
             "anchor_pos": [float(v) for v in a.anchor_pos],
             "anchor_rot": [float(v) for v in a.anchor_rot],
@@ -383,11 +488,15 @@ def main(argv=None):
             "inter_pos": [float(v) for v in a.inter_pos],
             "inter_rot": [float(v) for v in a.inter_rot],
         },
-        "anchor": {"pos": [float(v) for v in ANCHOR_POS],
-                   "quat_xyzw": [float(v) for v in ANCHOR_QUAT]},
-        "frame": FULL, "net_half": HALF,
+        "anchor": {
+            "pos": [float(v) for v in ANCHOR_POS],
+            "quat_xyzw": [float(v) for v in ANCHOR_QUAT],
+        },
+        "frame": FULL,
+        "net_half": HALF,
         "git_commit": git_commit(REPO),
-        "gl_renderer": "", "vk_device": "",
+        "gl_renderer": "",
+        "vk_device": "",
         "splits": {"train": [], "val": []},
         "stats": {},
     }
@@ -409,7 +518,8 @@ def main(argv=None):
                     sys.exit(
                         f"error: {split}: {candidates} candidates for "
                         f"{len(accepted_metas)}/{need} accepted "
-                        f"(rejected {rejected}). Widen ranges/gate.")
+                        f"(rejected {rejected}). Widen ranges/gate."
+                    )
                 candidates += 1
                 rec, ok, reason = sample_candidate(rng, a)
                 if not ok:
@@ -437,10 +547,16 @@ def main(argv=None):
                 # 1200-seq run never stages tens of GiB (unless --keep-raw).
                 if not a.keep_raw:
                     pre = os.path.join(rawdir, f"c{s['cand']:06d}")
-                    for suf in ("_src_rgba.bin", "_src_depth.bin",
-                                "_warp_rgba.bin", "_splat.bin",
-                                "_tm1_rgba.bin", "_tm1_depth.bin",
-                                "_t_rgba.bin", "_prev_rgba.bin"):
+                    for suf in (
+                        "_src_rgba.bin",
+                        "_src_depth.bin",
+                        "_warp_rgba.bin",
+                        "_splat.bin",
+                        "_tm1_rgba.bin",
+                        "_tm1_depth.bin",
+                        "_t_rgba.bin",
+                        "_prev_rgba.bin",
+                    ):
                         try:
                             os.remove(pre + suf)
                         except OSError:
@@ -458,11 +574,15 @@ def main(argv=None):
             "hole_min": float(np.min(holes)) if holes else 0.0,
             "hole_max": float(np.max(holes)) if holes else 0.0,
         }
-        print(f"[{split}] accepted {len(accepted_metas)}/{need} "
-              f"from {candidates} candidates, rejected={rejected}")
+        print(
+            f"[{split}] accepted {len(accepted_metas)}/{need} "
+            f"from {candidates} candidates, rejected={rejected}"
+        )
         if holes:
-            print(f"[{split}] hole frac: min={min(holes):.4f} "
-                  f"mean={sum(holes) / len(holes):.4f} max={max(holes):.4f}")
+            print(
+                f"[{split}] hole frac: min={min(holes):.4f} "
+                f"mean={sum(holes) / len(holes):.4f} max={max(holes):.4f}"
+            )
 
     manifest_path = os.path.join(outdir, "manifest.json")
     with open(manifest_path, "w") as f:

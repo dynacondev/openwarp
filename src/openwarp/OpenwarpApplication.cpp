@@ -10,7 +10,6 @@
 #include <filesystem>
 namespace fs = std::filesystem;
 #include <iostream>
-#include <fstream>
 #include <glm/mat4x4.hpp>
 #include "util/shader_util.hpp"
 #include <glm/gtc/matrix_transform.hpp>
@@ -465,7 +464,7 @@ void OpenwarpApplication::drawGUI(){
     if(isVulkan || useRay) {
         ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "N/A");
     } else {
-        ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "%d x %d", meshWidth, meshHeight);
+        ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "%zu x %zu", meshWidth, meshHeight);
     }
     
     if (useVsync == true)

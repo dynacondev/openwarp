@@ -311,7 +311,7 @@ bool VulkanNnFill::Fill(uint32_t w, uint32_t h, std::vector<uint8_t>& rgba, cons
 			for (uint32_t x = 0; x < w; x++) {
 				size_t i = (size_t)y * w + x;
 				bool hole = splat ? (splat[i] == kSplatEmpty) : (rgba[4 * i + 3] == 0);
-				if (hole && (uint32_t)c == 0) {
+				if (hole && c == 0) {
 					// First touch of this hole pixel: set alpha once.
 					rgba[4 * i + 3] = 255;
 				}

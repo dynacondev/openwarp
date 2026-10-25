@@ -11,17 +11,20 @@
 # Part of the Openwarp project, NCSA licensed (see LICENSE).
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 
 class GatedConv2d(nn.Module):
     """Feature conv * sigmoid(gate conv). Gate bias init decides openness."""
 
-    def __init__(self, in_ch: int, out_ch: int, kernel: int = 3, gate_bias: float = 2.0):
+    def __init__(
+        self, in_ch: int, out_ch: int, kernel: int = 3, gate_bias: float = 2.0
+    ):
         super().__init__()
         pad = kernel // 2
         self.feature = nn.Conv2d(in_ch, out_ch, kernel, padding=pad, bias=True)
         self.gate = nn.Conv2d(in_ch, out_ch, kernel, padding=pad, bias=True)
+        assert self.gate.bias is not None  # Conv2d(bias=True) always allocates it
         nn.init.constant_(self.gate.bias, gate_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -68,19 +71,23 @@ def init_blur_weights(model: TinyFillNet) -> None:
     """
     with torch.no_grad():
         f = model.gated.feature
+        assert f.bias is not None
         nn.init.zeros_(f.weight)
         nn.init.zeros_(f.bias)
         for o in range(model.hidden):
             f.weight[o, o % 3, :, :] = 1.0 / 9.0
         g = model.gated.gate
+        assert g.bias is not None
         nn.init.zeros_(g.weight)
         nn.init.constant_(g.bias, 2.0)
         for conv in (model.body1, model.body2):
+            assert conv.bias is not None
             nn.init.zeros_(conv.weight)
             nn.init.zeros_(conv.bias)
             for c in range(model.hidden):
                 conv.weight[c, c, 1, 1] = 1.0
         h = model.head
+        assert h.bias is not None
         nn.init.zeros_(h.weight)
         nn.init.zeros_(h.bias)
         per_group = model.hidden // 3
@@ -90,7 +97,8 @@ def init_blur_weights(model: TinyFillNet) -> None:
                 h.weight[o, o + 3 * k, 0, 0] = 1.0 / per_group
 
 
-def composite(warped_rgb: torch.Tensor, pred_rgb: torch.Tensor,
-              hole_mask: torch.Tensor) -> torch.Tensor:
+def composite(
+    warped_rgb: torch.Tensor, pred_rgb: torch.Tensor, hole_mask: torch.Tensor
+) -> torch.Tensor:
     """Hard-mask composite: valid pixels pass through bit-exact."""
     return torch.where(hole_mask > 0.5, pred_rgb, warped_rgb)

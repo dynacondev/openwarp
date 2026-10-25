@@ -43,9 +43,11 @@ class HoleFillDataset(Dataset):
         self.root = root
         self.split_dir = os.path.join(root, split)
         self.prev_mode = prev_mode
-        names = sorted(f[:-len("__src.npz")]
-                       for f in os.listdir(self.split_dir)
-                       if f.endswith("__src.npz"))
+        names = sorted(
+            f[: -len("__src.npz")]
+            for f in os.listdir(self.split_dir)
+            if f.endswith("__src.npz")
+        )
         if not names:
             raise RuntimeError(f"no sequences in {self.split_dir}")
         self.names = names
@@ -62,9 +64,9 @@ class HoleFillDataset(Dataset):
         with open(os.path.join(self.split_dir, self.names[i] + "__meta.json")) as f:
             return json.load(f)
 
-    def __getitem__(self, i):
+    def __getitem__(self, index):
         d = self.split_dir
-        n = self.names[i]
+        n = self.names[index]
         inp = np.load(os.path.join(d, n + "__input_t.npz"))
         true_rgb = np.load(os.path.join(d, n + "__true_t.npz"))["rgb"]
         warped = inp["warped_rgb"].astype(np.float32) / 255.0
@@ -73,12 +75,13 @@ class HoleFillDataset(Dataset):
         prev = inp["prev"].astype(np.float32) / 255.0
         if self.prev_mode == "zero":
             prev = np.zeros_like(prev)
-        x = np.concatenate([warped,
-                            depth[..., None],
-                            mask[..., None],
-                            prev[..., None]], axis=-1)
+        x = np.concatenate(
+            [warped, depth[..., None], mask[..., None], prev[..., None]], axis=-1
+        )
         x = torch.from_numpy(np.transpose(x, (2, 0, 1)).copy())
         tgt = torch.from_numpy(
-            np.transpose((true_rgb.astype(np.float32) / 255.0) *
-                         mask[..., None], (2, 0, 1)).copy())
+            np.transpose(
+                (true_rgb.astype(np.float32) / 255.0) * mask[..., None], (2, 0, 1)
+            ).copy()
+        )
         return x, tgt, torch.from_numpy(mask.copy())

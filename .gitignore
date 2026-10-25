@@ -48,6 +48,9 @@ __pycache__/
 
 # Hole-fill dataset outputs (ml/datasetgen/gen_dataset.py --out data)
 data/
+# Transient 1024px raw bins (ml/datasetgen/raw); normally deleted per batch
+# unless --keep-raw, but a crash/interrupt can leave them behind.
+ml/datasetgen/raw/
 # Built datasetgen capture binary (rebuild via ml/datasetgen/README.md)
 ml/datasetgen/capture
 
