@@ -30,6 +30,7 @@ done
 if [ "$WIPE" = 1 ]; then
 	rm -rf build
 fi
+mkdir -p build
 
 # Auto-detect a local onnxruntime C++ release (3060 host: tarball in ~/opt).
 # Prefer gpu_cuda13 (matches the pinned onnxruntime-gpu 1.31 wheels), then
@@ -57,11 +58,11 @@ if [ -n "$ORT_ROOT" ]; then
 	CMAKE_ARGS+=("-DONNXRUNTIME_ROOT=$ORT_ROOT")
 fi
 
-cmake -B build "${CMAKE_ARGS[@]}" > /tmp/opencode/cmake-configure.log 2>&1 || {
-	cat /tmp/opencode/cmake-configure.log
+cmake -B build "${CMAKE_ARGS[@]}" > build/cmake-configure.log 2>&1 || {
+	cat build/cmake-configure.log
 	exit 1
 }
-grep -E "CMAKE_BUILD_TYPE|onnxruntime C\+\+" /tmp/opencode/cmake-configure.log || true
+grep -E "CMAKE_BUILD_TYPE|onnxruntime C\+\+" build/cmake-configure.log || true
 cmake --build build --target openwarp_vulkan_shaders openwarp-vulkan-test openwarp
 
 echo "---"
