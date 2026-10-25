@@ -17,6 +17,14 @@
 #include <fstream>
 #include <iostream>
 #include <thread>
+#if defined(OPENWARP_HAS_ORT) && defined(__linux__)
+// dlfcn (dladdr/RTLD_DEFAULT) + glob need _GNU_SOURCE (set in CMake for
+// the ORT build); sys/stat filters glob hits to directories.
+#include <dlfcn.h>
+#include <glob.h>
+#include <sys/stat.h>
+#endif
+#include <cassert>
 
 namespace openwarp_vk {
 
@@ -60,6 +68,171 @@ float BilinearAt(const float* src, int sw, int sh, float fx, float fy)
 
 } // namespace
 
+#if defined(OPENWARP_HAS_ORT) && defined(__linux__)
+namespace {
+
+// CUDA/cuDNN user-space libs that libonnxruntime_providers_cuda.so needs
+// at load time. Ground truth is the provider lib's own DT_NEEDED (CUDA 13
+// era; readelf -d on the 1.31.0 gpu_cuda13 tarball):
+//   libcublasLt.so.13, libcublas.so.13, libcurand.so.10, libcudart.so.13
+// plus libcuda.so.1 (driver) and system libs (not our problem). Notably
+// the provider lib carries NO RUNPATH/RPATH and does NOT DT_NEEDED
+// libcudnn/libnvrtc, so same-dir symlinks alone never satisfy the loader
+// — hence the absolute-path RTLD_GLOBAL preload below.
+const char* kCudaDepLibs[] = {
+    "libcublasLt.so.13",
+    "libcublas.so.13",
+    "libcurand.so.10",
+    "libcudart.so.13",
+};
+
+// Directory holding the already-loaded libonnxruntime, with no env vars:
+// resolve a known ORT export to its real definition, then dladdr it.
+// (dlsym — NOT &OrtGetApiBase, which is this binary's PLT stub — so the
+// address belongs to the provider library itself.)
+std::string OrtLibDir()
+{
+	void* sym = dlsym(RTLD_DEFAULT, "OrtGetApiBase");
+	if (!sym)
+		return {};
+	Dl_info info{};
+	if (!dladdr(sym, &info) || !info.dli_fname)
+		return {};
+	std::string path = info.dli_fname;
+	size_t slash = path.find_last_of('/');
+	if (slash == std::string::npos)
+		return {};
+	return path.substr(0, slash);
+}
+
+void SplitDirs(const char* list, std::vector<std::string>& out)
+{
+	if (!list)
+		return;
+	std::string cur;
+	for (const char* p = list;; ++p) {
+		if (*p == ':' || *p == '\0') {
+			if (!cur.empty())
+				out.push_back(cur);
+			cur.clear();
+			if (*p == '\0')
+				return;
+		} else {
+			cur += *p;
+		}
+	}
+}
+
+void GlobDirs(const char* pattern, std::vector<std::string>& out)
+{
+	glob_t found{};
+	if (glob(pattern, 0, nullptr, &found) != 0)
+		return;
+	for (size_t i = 0; i < found.gl_pathc; ++i) {
+		std::string d = found.gl_pathv[i];
+		struct stat st{};
+		if (stat(d.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+			while (!d.empty() && d.back() == '/')
+				d.pop_back();
+			if (!d.empty())
+				out.push_back(d);
+		}
+	}
+	globfree(&found);
+}
+
+// Where to look for the CUDA dep libs, in order: (1) the dir holding the
+// loaded libonnxruntime (no env needed — covers the tarball lib dir and
+// any symlinks placed there), (2) every LD_LIBRARY_PATH entry, (3) the
+// active venv's nvidia/*/lib dirs, then ../ml/.venv-style relative
+// fallbacks (globbed, last resort: depend on CWD + venv layout).
+std::vector<std::string> CudaDepDirs()
+{
+	std::vector<std::string> dirs;
+	std::string ortDir = OrtLibDir();
+	if (!ortDir.empty())
+		dirs.push_back(ortDir);
+	SplitDirs(std::getenv("LD_LIBRARY_PATH"), dirs);
+	if (const char* venv = std::getenv("VIRTUAL_ENV")) {
+		std::string pat = std::string(venv) + "/lib/python*/site-packages/nvidia/*/lib";
+		GlobDirs(pat.c_str(), dirs);
+	}
+	GlobDirs("ml/.venv/lib/python*/site-packages/nvidia/*/lib", dirs);
+	GlobDirs("../ml/.venv/lib/python*/site-packages/nvidia/*/lib", dirs);
+	std::vector<std::string> uniq;
+	for (auto& d : dirs) {
+		if (!d.empty() && std::find(uniq.begin(), uniq.end(), d) == uniq.end())
+			uniq.push_back(d);
+	}
+	return uniq;
+}
+
+} // namespace
+#endif
+
+#ifdef OPENWARP_HAS_ORT
+namespace {
+
+// ORT lib dir for the "where to symlink" hint. Real implementation above
+// (Linux); empty elsewhere (message names the dir generically instead).
+#if !defined(__linux__)
+std::string OrtLibDir()
+{
+	return {};
+}
+#endif
+
+// dlopen() every CUDA dep basename from the first candidate dir that holds
+// it, RTLD_NOW|RTLD_GLOBAL, BEFORE the CUDA EP session is created, so the
+// provider .so's own DT_NEEDED resolves to the preloaded objects even when
+// the loader search path is broken (gamemode/env-sanitize wiping
+// LD_LIBRARY_PATH on the 3060 host). Handles stay open for process
+// lifetime (standard preload practice, cf. Python ort.preload_dlls()).
+// Returns basenames missing everywhere — reported only if the CUDA EP
+// then actually fails, so a CPU-only box never warns about CUDA libs it
+// never needed. Each attempt is logged iff OPENWARP_NN_LOG=1.
+std::vector<std::string> PreloadCudaDeps()
+{
+#if defined(OPENWARP_HAS_ORT) && defined(__linux__)
+	const bool verbose = VulkanNnFill::LogVerbose();
+	std::vector<std::string> dirs = CudaDepDirs();
+	if (verbose) {
+		std::cout << "[nn-fill] cuda-dep search dirs (" << dirs.size() << "):";
+		for (auto& d : dirs)
+			std::cout << " " << d;
+		std::cout << std::endl;
+	}
+	static std::vector<void*> held; // NOLINT: intentionally never dlclosed
+	std::vector<std::string> missing;
+	const size_t nLibs = sizeof(kCudaDepLibs) / sizeof(kCudaDepLibs[0]);
+	for (size_t li = 0; li < nLibs; ++li) {
+		const char* lib = kCudaDepLibs[li];
+		bool have = false;
+		for (auto& d : dirs) {
+			std::string abs = d + "/" + lib;
+			dlerror(); // reset: a stale message must not be misattributed
+			void* h = dlopen(abs.c_str(), RTLD_NOW | RTLD_GLOBAL);
+			if (verbose)
+				std::cout << "[nn-fill] cuda-dep " << abs << (h ? ": ok" : ": miss")
+				          << std::endl;
+			if (h) {
+				held.push_back(h);
+				have = true;
+				break;
+			}
+		}
+		if (!have)
+			missing.emplace_back(lib);
+	}
+	return missing;
+#else
+	return {};
+#endif
+}
+
+} // namespace
+#endif // OPENWARP_HAS_ORT
+
 #ifdef OPENWARP_HAS_ORT
 struct VulkanNnFill::OrtState {
 	Ort::Env env{ORT_LOGGING_LEVEL_WARNING, "openwarp-nn-fill"};
@@ -72,13 +245,7 @@ struct VulkanNnFill::OrtState {
 
 VulkanNnFill::VulkanNnFill() = default;
 
-VulkanNnFill::~VulkanNnFill()
-{
-#ifdef OPENWARP_HAS_ORT
-	delete ort_;
-	ort_ = nullptr;
-#endif
-}
+VulkanNnFill::~VulkanNnFill() = default;
 
 bool VulkanNnFill::Fail(std::string* error, const std::string& msg)
 {
@@ -119,8 +286,7 @@ bool VulkanNnFill::Load(const std::string& modelPath, std::string* error)
 	}
 #endif
 #ifdef OPENWARP_HAS_ORT
-	delete ort_;
-	ort_ = nullptr;
+	ort_.reset();
 #endif
 
 	std::ifstream f(modelPath, std::ios::binary | std::ios::ate);
@@ -132,7 +298,7 @@ bool VulkanNnFill::Load(const std::string& modelPath, std::string* error)
 
 #ifdef OPENWARP_HAS_ORT
 	try {
-		ort_ = new OrtState();
+		ort_ = std::make_unique<OrtState>();
 		Ort::SessionOptions opts;
 		opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 		opts.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
@@ -153,7 +319,12 @@ bool VulkanNnFill::Load(const std::string& modelPath, std::string* error)
 		// Prefer the CUDA EP when the linked ORT ships it (3060 host).
 		// CPU Ort::Values still work (ORT inserts the copies); when the
 		// build is CPU-only this throws and we fall through to CPU EP.
+		// Before that, preload the provider's DT_NEEDED CUDA libs by
+		// absolute path (RTLD_GLOBAL): the provider .so carries no
+		// RUNPATH, so a sanitized LD_LIBRARY_PATH breaks its load even
+		// when the files sit next to it or in the venv.
 		bool cudaEp = false;
+		std::vector<std::string> cudaDepsMissing = PreloadCudaDeps();
 		try {
 			OrtCUDAProviderOptions cudaOpts{};
 			if (const char* de = std::getenv("OPENWARP_NN_CUDA_DEVICE"))
@@ -163,6 +334,15 @@ bool VulkanNnFill::Load(const std::string& modelPath, std::string* error)
 		} catch (const Ort::Exception& e) {
 			std::cerr << "[nn-fill] CUDA EP unavailable (" << e.what()
 			          << "); using CPU EP." << std::endl;
+			for (const std::string& lib : cudaDepsMissing) {
+				std::string ortDir = OrtLibDir();
+				std::cerr << "[nn-fill] cuda-dep missing: " << lib
+				          << " (place/symlink it into "
+				          << (ortDir.empty() ? "<the dir holding libonnxruntime>"
+				                             : ortDir)
+				          << ", or export LD_LIBRARY_PATH=<venv>/nvidia/*/lib)"
+				          << std::endl;
+			}
 		}
 		providers_ = cudaEp ? "ORT[cuda,cpu]" : "ORT[cpu]";
 		ort_->session = Ort::Session(ort_->env, modelPath.c_str(), opts);
@@ -183,14 +363,23 @@ bool VulkanNnFill::Load(const std::string& modelPath, std::string* error)
 			throw std::runtime_error("input must be 1x6xHxW");
 		if (outShape.size() != 4 || outShape[0] != 1 || outShape[1] != kOutCh)
 			throw std::runtime_error("output must be 1x3xHxW");
+		// Spatial dims must be dynamic (-1) or exactly the net size.
+		// Rejecting a fixed-shape mismatch here (loud, at load) instead
+		// of throwing per-warp after ORT already allocated: RunInfer
+		// feeds exactly 1x6x512x512 and copies out exactly 1x3x512x512.
+		for (int i = 2; i < 4; i++) {
+			if ((inShape[i] != -1 && inShape[i] != kNet) ||
+			    (outShape[i] != -1 && outShape[i] != kNet))
+				throw std::runtime_error("model H/W must be dynamic or " +
+				                         std::to_string(kNet));
+		}
 		if (inEl != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
 		    outEl != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
 			throw std::runtime_error("input/output must be float32");
 		// H/W stay dynamic (export uses dynamic axes); only batch and
 		// channel extents are pinned above.
 	} catch (const std::exception& e) {
-		delete ort_;
-		ort_ = nullptr;
+		ort_.reset();
 		return Fail(error, std::string("ORT session failed for ") + modelPath + ": " + e.what());
 	}
 	useMock_ = false;
@@ -206,6 +395,15 @@ bool VulkanNnFill::Load(const std::string& modelPath, std::string* error)
 	          << "; 3x3 box blur of input RGB; plumbing + hard-mask composite are identical)"
 	          << std::endl;
 #endif
+	// Hot-path buffers are sized once here (not per warp): steady-state
+	// Fill never reallocates, so no ORT Value can ever alias a buffer
+	// across a reallocation. bad_alloc surfaces as a clean load error.
+	try {
+		scratchInput_.resize((size_t)kInCh * kNet * kNet);
+		scratchPred_.resize((size_t)kOutCh * kNet * kNet);
+	} catch (const std::exception& e) {
+		return Fail(error, std::string("NN scratch alloc failed: ") + e.what());
+	}
 	loaded_ = true;
 	modelPath_ = modelPath;
 	return true;
@@ -271,22 +469,37 @@ bool VulkanNnFill::RunInfer(const float* input6ch, float* pred3ch)
 	const size_t outCount = (size_t)kOutCh * kNet * kNet;
 #ifdef OPENWARP_HAS_ORT
 	try {
+		// The Values below alias the caller buffers in place (no copy):
+		// inTensor references input6ch until the end of the scope, the
+		// output Value owns its (arena) buffer until outs dies. Both die
+		// before the memcpy'd result is validated, and neither outlives
+		// this call — so Fill's scratch can never be reallocated from
+		// under a live Value (it is resized only before BuildInput, when
+		// no Value exists). The inner scope makes that lifetime explicit.
 		std::array<int64_t, 4> inShape{1, kInCh, kNet, kNet};
-		std::array<int64_t, 4> outShape{1, kOutCh, kNet, kNet};
-		Ort::Value inTensor = Ort::Value::CreateTensor<float>(
-		    ort_->mem, const_cast<float*>(input6ch), inCount, inShape.data(), 4);
-		const char* inNames[] = {ort_->inputName.c_str()};
-		const char* outNames[] = {ort_->outputName.c_str()};
-		std::vector<Ort::Value> outs =
-		    ort_->session.Run(Ort::RunOptions{nullptr}, inNames, &inTensor, 1, outNames, 1);
-		Ort::Value& o = outs[0];
-		if (!o.IsTensor())
-			throw std::runtime_error("output is not a tensor");
-		auto info = o.GetTensorTypeAndShapeInfo();
-		if (info.GetElementCount() != (int64_t)outCount)
-			throw std::runtime_error("output element count mismatch");
-		const float* src = o.GetTensorData<float>();
-		std::memcpy(pred3ch, src, outCount * sizeof(float));
+		assert(inCount == (size_t)kInCh * kNet * kNet);
+		assert(outCount == (size_t)kOutCh * kNet * kNet);
+		{
+			Ort::Value inTensor = Ort::Value::CreateTensor<float>(
+			    ort_->mem, const_cast<float*>(input6ch), inCount, inShape.data(), 4);
+			const char* inNames[] = {ort_->inputName.c_str()};
+			const char* outNames[] = {ort_->outputName.c_str()};
+			std::vector<Ort::Value> outs = ort_->session.Run(Ort::RunOptions{nullptr},
+			                                                 inNames, &inTensor, 1,
+			                                                 outNames, 1);
+			if (outs.size() != 1)
+				throw std::runtime_error("ORT returned != 1 output tensor");
+			Ort::Value& o = outs[0];
+			if (!o.IsTensor())
+				throw std::runtime_error("output is not a tensor");
+			auto info = o.GetTensorTypeAndShapeInfo();
+			if (info.GetElementCount() != outCount)
+				throw std::runtime_error("output element count mismatch");
+			const float* src = o.GetTensorData<float>();
+			if (!src)
+				throw std::runtime_error("null output tensor data");
+			std::memcpy(pred3ch, src, outCount * sizeof(float));
+		} // inTensor + outs die here: no live alias remains past this point.
 		for (size_t i = 0; i < outCount; i++) {
 			if (!std::isfinite(pred3ch[i]))
 				throw std::runtime_error("non-finite network output");
@@ -427,6 +640,11 @@ bool VulkanNnFill::Fill(uint32_t w, uint32_t h, std::vector<uint8_t>& rgba, cons
 	const uint8_t* prev = (prevFilled_.size() == rgba.size() && prevW_ == w && prevH_ == h)
 	                          ? prevFilled_.data()
 	                          : nullptr;
+	// prev aliases prevFilled_ (read-only, consumed by BuildInput below)
+	// and splat aliases the caller's plane (read-only, whole call): both
+	// stay valid because neither vector is resized while in use — the
+	// only writes (scratch resizes above, prevFilled_ copy at the end)
+	// happen strictly outside the read windows.
 	FillStats s;
 	s.holes = holes;
 	s.holeFrac = px ? (double)holes / (double)px : 0.0;
@@ -453,15 +671,17 @@ bool VulkanNnFill::Fill(uint32_t w, uint32_t h, std::vector<uint8_t>& rgba, cons
 		return true;
 	}
 
-	// Reused scratch (sizes change only with net/frame size): Fill never
-	// mallocs in the hot path anymore (the old per-warp input/pred/up
-	// vectors did three big allocations per warp).
+	// Reused scratch: sized once at Load (hot path never reallocates).
+	// The conditional resize stays as a no-op safety net. It runs here,
+	// BEFORE BuildInput creates any ORT Value aliasing these buffers
+	// (see RunInfer), so no realloc-while-aliased is possible.
 	const size_t inCount = (size_t)kInCh * kNet * kNet;
 	const size_t outCount = (size_t)kOutCh * kNet * kNet;
 	if (scratchInput_.size() != inCount)
 		scratchInput_.resize(inCount);
 	if (scratchPred_.size() != outCount)
 		scratchPred_.resize(outCount);
+	assert(scratchInput_.size() == inCount && scratchPred_.size() == outCount);
 	BuildInput(w, h, rgba.data(), splat, prev, scratchInput_.data());
 	const double tBuild = NowMs();
 	if (!RunInfer(scratchInput_.data(), scratchPred_.data()))

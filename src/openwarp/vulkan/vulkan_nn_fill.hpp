@@ -8,6 +8,12 @@
 // Frame is 1024x1024 (OpenwarpApplication WIDTH/HEIGHT); the prev frame
 // is the last presented/filled frame (free-running, no teacher forcing).
 //
+// Threading: VulkanNnFill is NOT thread-safe — Fill/RunInfer run on the
+// single warp thread. ORT intra-op threads (OPENWARP_NN_THREADS) are
+// internal to one session Run and always joined before RunInfer returns,
+// so reusing the scratch/prev buffers across warps is race-free by
+// construction (sequential reuse, never concurrent).
+//
 // Dependency-light: the ONNX Runtime C++ API is used only when
 // OPENWARP_HAS_ORT is set (CMake defines it when headers + lib are
 // found). Without ORT the backend is a mock session: a 3x3 box blur of
@@ -24,6 +30,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -91,14 +98,26 @@ public:
 	// One inference: input 1x6x512x512 NCHW float -> pred 1x3x512x512.
 	// ORT when built with it, else the mock box blur. False on error
 	// (latches disabled via DisableToBlack).
+	// Buffer contract: the ORT input Value references input6ch in place
+	// (no copy) for the duration of the call, so the caller must not
+	// resize, move or free either buffer until RunInfer returns. (Fill
+	// resizes its scratch only before any Value exists; RunInfer itself
+	// never reallocates.)
 	bool RunInfer(const float* input6ch, float* pred3ch);
 
 	// Full frame path: in-place fill of a w*h RGBA8 warp output whose
 	// holes are (0,0,0,0) (what warp_fill.comp mode 0 produces). splat
 	// is the w*h R32_UINT splat plane, or nullptr (hole = alpha==0
-	// fallback, depth channel 0). Updates the cached prev-frame luma
-	// from the filled result. Any failure returns false with rgba left
-	// untouched (caller presents the black-hole frame).
+	// fallback, depth channel 0).
+	// Splat lifetime: splat must point to at least w*h values that stay
+	// valid for the whole (synchronous) call — e.g.
+	// vulkanWarp->LastSplatPlane().data() from a coverage warp. No size
+	// travels with a raw pointer, so the caller must check
+	// plane.size() == w*h before passing splat (the app dispatch does)
+	// and must not mutate the plane during the call.
+	// Updates the cached prev-frame luma from the filled result. Any
+	// failure returns false with rgba left untouched (caller presents
+	// the black-hole frame).
 	bool Fill(uint32_t w, uint32_t h, std::vector<uint8_t>& rgba, const uint32_t* splat);
 
 	// Pure-CPU helpers shared by Fill and the headless harness.
@@ -123,10 +142,14 @@ private:
 	std::string modelPath_;
 	std::string lastError_;
 	FillStats lastStats_;
-	// Hot-path scratch (6.3 MiB + 3.1 MiB at kNet=512): allocated once,
-	// reused every warp so Fill never mallocs in the hot path. The old
-	// per-warp vectors (input/pred/full-res up plane) are gone; the
-	// composite now samples hole pixels directly from the pred planes.
+	// Hot-path scratch (6.3 MiB + 3.1 MiB at kNet=512): sized once at
+	// Load so steady-state Fill never mallocs. The conditional resize in
+	// Fill is a no-op safety net after that. Values created in RunInfer
+	// alias these buffers, so sizing them anywhere a Value is alive
+	// would be a use-after-realloc — the order is: resize (Fill, no
+	// Value exists) -> BuildInput -> RunInfer (Values live and die
+	// inside) -> composite. Never resize between CreateTensor and the
+	// end of RunInfer.
 	std::vector<float> scratchInput_;
 	std::vector<float> scratchPred_;
 	// Rolling 1 s summary accumulators (reset each print).
@@ -149,7 +172,7 @@ private:
 	uint32_t prevH_ = 0;
 #ifdef OPENWARP_HAS_ORT
 	struct OrtState;
-	OrtState* ort_ = nullptr;
+	std::unique_ptr<OrtState> ort_; // RAII: session dies before env (see .cpp order)
 #endif
 };
 

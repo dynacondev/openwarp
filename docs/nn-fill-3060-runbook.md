@@ -92,6 +92,70 @@ Configure must print `onnxruntime C++ found: ... - NN fill uses ORT`
 `mock`. Tuning knobs: `OPENWARP_NN_THREADS=N` (intra-op pool, default =
 core count), `OPENWARP_NN_CUDA_DEVICE=0`.
 
+### 3b. CUDA provider .so deps without LD_LIBRARY_PATH roulette (3060)
+
+Symptom this fixes: `libonnxruntime_providers_cuda.so` fails with
+`libcublasLt.so.13: cannot open shared object file` even with the venv
+nvidia lib dirs exported (gamemode/env-sanitize can wipe the environment
+on the 3060 host).
+
+Automatic primary (no env needed in the common case): at ORT init, before
+the CUDA EP session is created, the binary `dlopen()`s the provider's
+DT_NEEDED CUDA libs by absolute path with `RTLD_NOW|RTLD_GLOBAL` from, in
+order:
+
+1. the dir holding the loaded `libonnxruntime` (found via `dladdr` on the
+   `OrtGetApiBase` export — covers the tarball `lib/` dir and any
+   symlinks placed in it, no env vars involved),
+2. every dir in `LD_LIBRARY_PATH`,
+3. `$VIRTUAL_ENV/lib/python*/site-packages/nvidia/*/lib`, then
+   `ml/.venv/...` and `../ml/.venv/...` relative globs (last resort:
+   depend on CWD + venv layout).
+
+Handles stay open for process lifetime (standard preload practice, cf.
+Python `ort.preload_dlls()`). Each attempt is logged with
+`OPENWARP_NN_LOG=1`. If the CUDA EP still fails, the existing loud line
+is unchanged (`CUDA EP unavailable (...); using CPU EP.`) plus one
+`cuda-dep missing: <file>` line per library found nowhere, naming the
+exact filename and where to place/symlink it.
+
+`readelf` ground truth (verified 2026-10-25 against the 1.31.0
+`gpu_cuda13` tarball — `readelf -d` is arch-independent, so an ARM box
+can check the x86_64 artifact):
+
+```
+$ tar xzf onnxruntime-linux-x64-gpu_cuda13-1.31.0.tgz \
+      onnxruntime-linux-x64-gpu_cuda13-1.31.0/lib/libonnxruntime_providers_cuda.so
+$ readelf -d .../lib/libonnxruntime_providers_cuda.so | grep -E 'NEEDED|RUNPATH|RPATH'
+  NEEDED  libcublasLt.so.13, libcublas.so.13, libcurand.so.10, libcudart.so.13
+          (+ libcuda.so.1 from the driver, plus system libs)
+  (no RUNPATH or RPATH entries at all)
+```
+
+Consequences, stated plainly: the provider lib has **no `$ORIGIN`**, so
+symlinking the venv libs into the tarball `lib/` dir **alone does not
+satisfy the loader** — it only helps combined with the `LD_LIBRARY_PATH`
+fallback below or `ldconfig`. And there is **no `libcudnn`/`libnvrtc`
+DT_NEEDED** on this provider lib, so the C++ provider path needs just
+the 4 files above (Python ORT wants more; that is a different loader).
+`libcuda.so.1` must come from the NVIDIA driver — no driver, no CUDA EP,
+loud CPU fallback.
+
+Fallback (kept): if the preload finds nothing (unusual layout), export
+the venv lib dirs explicitly before launch, then confirm with `ldd`:
+
+```
+VENV=ml/.venv/lib/python3.12/site-packages   # adjust to the 3060 venv
+export LD_LIBRARY_PATH=$VENV/nvidia/cublas/lib:$VENV/nvidia/curand/lib:$VENV/nvidia/cuda_runtime/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+ldd <ort>/lib/libonnxruntime_providers_cuda.so | grep 'not found'   # must be empty
+ls $VENV/nvidia/*/lib/lib{cublasLt,cublas,curand,cudart}*.so*       # the 4 files
+```
+
+3060 verification: `OPENWARP_NN_LOG=1` run must show `cuda-dep ...: ok`
+lines (or none needed) and `providers=ORT[cuda,cpu]` in the `ready`
+line; `ldd ... | grep 'not found'` empty. Any `cuda-dep missing:` line
+names the exact file + the two places to fix.
+
 ## 4. Read the summary, map each stage to its budget
 
 | stage (`nn` split) | budget | over budget => |

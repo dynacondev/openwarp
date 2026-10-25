@@ -162,6 +162,12 @@ if(OPENWARP_ENABLE_VULKAN)
                 target_include_directories(openwarp_vulkan PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
                 target_link_libraries(openwarp_vulkan PRIVATE ${ONNXRUNTIME_LIB})
                 target_compile_definitions(openwarp_vulkan PRIVATE OPENWARP_HAS_ORT=1)
+                # CUDA-EP dep preload (dlopen-by-absolute-path in
+                # vulkan_nn_fill.cpp) needs dlfcn; _GNU_SOURCE exposes
+                # dladdr()/RTLD_DEFAULT. CMAKE_DL_LIBS is empty on glibc
+                # >= 2.34 (dlopen in libc) — harmless either way.
+                target_compile_definitions(openwarp_vulkan PRIVATE _GNU_SOURCE)
+                target_link_libraries(openwarp_vulkan PRIVATE ${CMAKE_DL_LIBS})
             else()
                 message(STATUS "onnxruntime C++ not found - NN fill uses mock box-blur backend")
             endif()
