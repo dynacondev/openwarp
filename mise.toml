@@ -4,6 +4,8 @@
 [tools]
 python = "3.12"
 uv = "latest"
+ruff = "latest"
+ty = "latest"
 
 [tasks.setup-cpu]
 description = "Create ml/.venv (py3.12) and install the CPU torch stack via uv"
