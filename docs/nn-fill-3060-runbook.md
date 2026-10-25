@@ -182,24 +182,33 @@ TorchScript version match is strict: the `.pt` must be scripted by the
 SAME torch (2.9.1) as the libtorch that loads it — export on the 3060
 venv (§3c validation), never copy a `.pt` across torch versions.
 
-3060 setup (do NOT download on dev/ARM boxes — multi-GiB, and there is
-no official Linux-aarch64 libtorch zip anyway):
+3060 setup — zero download (preferred): the mise venv's torch package
+already ships full libtorch headers + libs (exact version match with
+`export_script.py` by construction). `./build.sh` auto-detects it, so on
+a fresh pull this is the whole procedure:
+
+```
+ml/.venv/bin/python ml/export_script.py   # writes ml/weights/fill_blur_init.pt, reload-checks it
+./build.sh                                 # auto-detects ml/.venv torch, prints Torch C++ : manual link (…)
+```
+
+No `TORCH_ROOT` needed, no CUDA toolkit needed (the manual link bypasses
+`TorchConfig.cmake`, whose Caffe2 CUDA check fatals without one), no
+3 GiB download. If the venv ever lacks the C++ headers, fall back to an
+unpacked libtorch distro (`TORCH_ROOT=~/opt/libtorch`, same
+include/+lib/ layout):
 
 ```
 cd ~/opt
 curl -LO https://download.pytorch.org/libtorch/cu126/libtorch-shared-with-deps-2.9.1%2Bcu126.zip
 unzip -q libtorch-shared-with-deps-2.9.1%2Bcu126.zip   # yields ~/opt/libtorch/
-ml/.venv/bin/python ml/export_script.py                # writes ml/weights/fill_blur_init.pt, reload-checks it
-./build.sh --torch-root ~/opt/libtorch                 # or TORCH_ROOT=~/opt/libtorch
+./build.sh --torch-root ~/opt/libtorch
 ```
 
-`build.sh` also auto-detects `~/opt/libtorch*` and `/opt/libtorch*`
-(`share/cmake/Torch/TorchConfig.cmake` must exist) and prints
-`Torch C++ : <dir>` in the summary. Configure must say `libtorch
-found - NN fill uses TorchScript (preferred over ORT when both link)`.
-No CUDA staging is done for torch (and none must be added): its bundled
-libs already carry `$ORIGIN` runpaths — do NOT copy/symlink anything
-into the libtorch dir.
+(`cu128` same pattern if cu126 ever lacks a build; libtorch bundles its
+own CUDA so the flavor need not match the venv. Do NOT download on
+dev/ARM boxes — multi-GiB, and there is no official Linux-aarch64
+libtorch zip anyway.)
 
 3060 validation (after the build):
 

@@ -8,6 +8,9 @@
 #endif
 #ifdef OPENWARP_HAS_TORCH
 #include <torch/script.h>
+#ifdef OPENWARP_HAS_TORCH
+#include <ATen/Parallel.h> // at::set_num_threads / set_num_interop_threads
+#endif
 #endif
 
 #include <algorithm>

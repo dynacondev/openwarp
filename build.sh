@@ -69,10 +69,12 @@ if [ -n "$ORT_ROOT" ]; then
 	CMAKE_ARGS+=("-DONNXRUNTIME_ROOT=$ORT_ROOT")
 fi
 
-# LibTorch auto-detect (3060 host: unzip the libtorch zip into ~/opt).
-# Explicit --torch-root / env always wins. Unlike ORT, torch needs no
-# CUDA staging here: its bundled libs already carry $ORIGIN runpaths,
-# so NEVER copy/symlink anything into the libtorch dir.
+# LibTorch auto-detect. Explicit --torch-root / env always wins. Then:
+#   1. unpacked libtorch distro (~/opt or /opt, has share/cmake/Torch);
+#   2. the mise venv's torch package (exact version match with the export
+#      scripts, zero download — the normal case on the 3060 host).
+# Unlike ORT, torch needs no CUDA staging here: its bundled libs already
+# carry $ORIGIN runpaths, so NEVER copy/symlink anything into these dirs.
 if [ -z "$TORCH_ROOT" ]; then
 	for cand in "$HOME"/opt/libtorch* /opt/libtorch*; do
 		if [ -f "$cand/share/cmake/Torch/TorchConfig.cmake" ]; then
@@ -81,9 +83,20 @@ if [ -z "$TORCH_ROOT" ]; then
 		fi
 	done
 fi
+if [ -z "$TORCH_ROOT" ]; then
+	for venv in "${VIRTUAL_ENV:-}" "$PWD/ml/.venv" "$PWD/../ml/.venv"; do
+		[ -n "$venv" ] || continue
+		for td in "$venv"/lib/python*/site-packages/torch; do
+			if [ -f "$td/include/torch/script.h" ] && [ -f "$td/lib/libtorch.so" ]; then
+				TORCH_ROOT="$td"
+				break 2
+			fi
+		done
+	done
+fi
 if [ -n "$TORCH_ROOT" ]; then
-	if [ ! -f "$TORCH_ROOT/share/cmake/Torch/TorchConfig.cmake" ]; then
-		echo "error: TORCH_ROOT=$TORCH_ROOT has no share/cmake/Torch/TorchConfig.cmake" >&2
+	if [ ! -f "$TORCH_ROOT/include/torch/script.h" ] || [ ! -f "$TORCH_ROOT/lib/libtorch.so" ]; then
+		echo "error: TORCH_ROOT=$TORCH_ROOT needs include/torch/script.h + lib/libtorch.so" >&2
 		exit 1
 	fi
 	CMAKE_ARGS+=("-DTORCH_ROOT=$TORCH_ROOT")
@@ -153,8 +166,11 @@ else
 	echo "ORT C++    : not found (NN fill uses Torch/mock backend)"
 fi
 TORCH_HIT="$(grep '^Torch_DIR:PATH=' build/CMakeCache.txt | cut -d= -f2 || true)"
-case "$TORCH_HIT" in
-"" | *NOTFOUND*) echo "Torch C++  : not found (NN fill uses ORT/mock backend)" ;;
-*) echo "Torch C++  : $TORCH_HIT" ;;
-esac
+if [ -n "$TORCH_HIT" ] && [ "$TORCH_HIT" != "*NOTFOUND*" ]; then
+	echo "Torch C++  : $TORCH_HIT (TorchConfig)"
+elif tr ' ' '\n' < build/CMakeFiles/openwarp.dir/link.txt 2>/dev/null | grep -q "libtorch\.so"; then
+	echo "Torch C++  : manual link ($(dirname "$(dirname "$(grep -o "[^ ']*libtorch\.so" build/CMakeFiles/openwarp.dir/link.txt | head -1)")"))"
+else
+	echo "Torch C++  : not found (NN fill uses ORT/mock backend)"
+fi
 git log --oneline -1

@@ -173,22 +173,72 @@ if(OPENWARP_ENABLE_VULKAN)
             endif()
             # LibTorch C++ (optional, preferred over ORT when both are
             # present: torch's CUDA stacking works on the 3060 host where
-            # ORT's prebuilt CUDA EP kept failing loader-side). Point
-            # TORCH_ROOT at an unpacked libtorch dir (it holds
-            # share/cmake/Torch/TorchConfig.cmake); without it (and without
-            # ORT) the build stays green with the mock backend. Libtorch
-            # bundles its own CUDA libs with $ORIGIN runpaths, so unlike
-            # ORT it needs no build.sh CUDA staging. Requires C++17, which
-            # this target already sets; no extra defines are added beyond
-            # what Torch itself demands.
-            set(TORCH_ROOT "" CACHE PATH "Prefix of an unpacked libtorch distribution (share/cmake/Torch/)")
-            if(TORCH_ROOT)
-                list(APPEND CMAKE_PREFIX_PATH "${TORCH_ROOT}")
+            # ORT's prebuilt CUDA EP kept failing loader-side). Two layouts
+            # are accepted under TORCH_ROOT (needs include/ + lib/):
+            #   - an unpacked libtorch distro (…/libtorch/{include,lib}), or
+            #   - the venv's torch package
+            #     (…/ml/.venv/lib/python*/site-packages/torch/{include,lib}):
+            #     exact version match with the export scripts, zero download.
+            # Linked directly (bypasses TorchConfig.cmake, whose Caffe2 CUDA
+            # check fatals on hosts without a system CUDA toolkit — the pip
+            # wheels carry their own CUDA user-space). Falls back to
+            # find_package only when the manual layout is absent AND nvcc
+            # exists (else that check would fatal the configure).
+            set(TORCH_ROOT "" CACHE PATH "Prefix of a libtorch layout (include/ + lib/)")
+            set(OPENWARP_TORCH_LIBS "")
+            if(TORCH_ROOT AND EXISTS "${TORCH_ROOT}/include/torch/script.h" AND
+               EXISTS "${TORCH_ROOT}/lib/libtorch.so")
+                target_include_directories(openwarp_vulkan PRIVATE "${TORCH_ROOT}/include")
+                foreach(_tl torch_cuda c10_cuda torch_cpu torch c10)
+                    if(EXISTS "${TORCH_ROOT}/lib/lib${_tl}.so")
+                        list(APPEND OPENWARP_TORCH_LIBS "${TORCH_ROOT}/lib/lib${_tl}.so")
+                    endif()
+                endforeach()
+                # torch's bundled OpenBLAS needs libgfortran (not in torch's
+                # own link interface when bypassing TorchConfig). Wrapped in
+                # --no-as-needed: nothing references it directly, so the
+                # default --as-needed would otherwise drop it and the link
+                # fails on the bundled OpenBLAS's undefined refs. Tried by
+                # versioned filename too: some distros ship no unversioned
+                # .so symlink (linking .so.5 directly is correct — the
+                # SONAME is what gets recorded).
+                set(OPENWARP_GFORTRAN "")
+                foreach(_gfdir /usr/lib/aarch64-linux-gnu /usr/lib/x86_64-linux-gnu /usr/local/lib64 /usr/lib64 /usr/lib)
+                    foreach(_gfname libgfortran.so libgfortran.so.5)
+                        if(NOT OPENWARP_GFORTRAN AND EXISTS "${_gfdir}/${_gfname}")
+                            set(OPENWARP_GFORTRAN "${_gfdir}/${_gfname}")
+                        endif()
+                    endforeach()
+                endforeach()
+                if(OPENWARP_GFORTRAN)
+                    list(APPEND OPENWARP_TORCH_LIBS
+                         "-Wl,--no-as-needed" "${OPENWARP_GFORTRAN}" "-Wl,--as-needed")
+                else()
+                    message(WARNING "libgfortran not found - libtorch link may fail (sudo apt install libgfortran5)")
+                endif()
+                message(STATUS "libtorch (manual link) at ${TORCH_ROOT} - NN fill uses TorchScript")
             endif()
-            find_package(Torch QUIET)
-            if(Torch_FOUND)
-                message(STATUS "libtorch found - NN fill uses TorchScript (preferred over ORT when both link)")
-                target_link_libraries(openwarp_vulkan PRIVATE ${TORCH_LIBRARIES})
+            find_program(OPENWARP_NVCC nvcc PATHS /usr/local/cuda/bin NO_DEFAULT_PATH)
+            if(NOT OPENWARP_NVCC)
+                find_program(OPENWARP_NVCC nvcc)
+            endif()
+            if(OPENWARP_TORCH_LIBS)
+                # manual layout above already resolved everything
+            elseif(OPENWARP_NVCC)
+                # Full-distro path via TorchConfig; guarded: its Caffe2 CUDA
+                # check is fatal without a toolkit, so only try this when a
+                # compiler-side CUDA exists (venv-torch layouts never land here).
+                if(TORCH_ROOT)
+                    list(APPEND CMAKE_PREFIX_PATH "${TORCH_ROOT}")
+                endif()
+                find_package(Torch QUIET)
+                if(Torch_FOUND)
+                    set(OPENWARP_TORCH_LIBS "${TORCH_LIBRARIES}")
+                    message(STATUS "libtorch found (TorchConfig) - NN fill uses TorchScript")
+                endif()
+            endif()
+            if(OPENWARP_TORCH_LIBS)
+                target_link_libraries(openwarp_vulkan PRIVATE ${OPENWARP_TORCH_LIBS})
                 target_compile_definitions(openwarp_vulkan PRIVATE OPENWARP_HAS_TORCH=1)
             else()
                 message(STATUS "libtorch not found (TORCH_ROOT=${TORCH_ROOT}) - NN fill uses ORT/mock backend")
