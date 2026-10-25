@@ -1,0 +1,8 @@
+# Install torch from the matching index first, then the rest from PyPI:
+#   CPU:  pip install --index-url https://download.pytorch.org/whl/cpu torch
+#   3060: pip install --index-url https://download.pytorch.org/whl/cu121 torch
+# Then: pip install -r ml/requirements.txt
+onnx
+onnxscript  # needed by torch.onnx exporter
+onnxruntime
+numpy

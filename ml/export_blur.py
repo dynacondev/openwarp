@@ -1,0 +1,110 @@
+# Export the blur-initialized TinyFillNet to ONNX + verify with onnxruntime.
+#
+#   python3 ml/export_blur.py [--out ml/weights/fill_blur_init.onnx] [--h 1024 --w 1280]
+#
+# Validates: ONNX loads in ORT, output shape/range sane, blur-init matches
+# a reference 3x3 box blur on valid pixels, and a CPU timing smoke test.
+# Real latency numbers come from the 3060 host (see ml/README.md) - CPU
+# timings here only prove the graph runs.
+#
+# Part of the Openwarp project, NCSA licensed (see LICENSE).
+
+import argparse
+import time
+
+import numpy as np
+import torch
+
+from fill_net import TinyFillNet, init_blur_weights
+
+
+def reference_box_blur(rgb: np.ndarray) -> np.ndarray:
+    """3x3 box blur of HxWx3 RGB, edge-replicated. Matches blur-init intent."""
+    padded = np.pad(rgb, ((1, 1), (1, 1), (0, 0)), mode="edge")
+    acc = np.zeros_like(rgb)
+    for dy in range(3):
+        for dx in range(3):
+            acc += padded[dy:dy + rgb.shape[0], dx:dx + rgb.shape[1]]
+    return acc / 9.0
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default="ml/weights/fill_blur_init.onnx")
+    ap.add_argument("--h", type=int, default=1024)
+    ap.add_argument("--w", type=int, default=1280)
+    ap.add_argument("--opset", type=int, default=17)
+    args = ap.parse_args()
+
+    torch.manual_seed(0)
+    model = TinyFillNet(in_ch=6, hidden=12)
+    init_blur_weights(model)
+    model.eval()
+
+    H, W = args.h, args.w
+    dummy = torch.zeros(1, 6, H, W)
+
+    import onnx
+
+    torch.onnx.export(
+        model,
+        dummy,
+        args.out,
+        input_names=["input"],
+        output_names=["output"],
+        dynamic_axes={"input": {2: "H", 3: "W"}, "output": {2: "H", 3: "W"}},
+        opset_version=args.opset,
+        do_constant_folding=True,
+        dynamo=False,  # legacy TorchScript exporter: Dynamo path is broken on py3.14
+    )
+    onnx_model = onnx.load(args.out)
+    onnx.checker.check_model(onnx_model)
+    print(f"[export] wrote {args.out} "
+          f"({len(onnx_model.SerializeToString()) / 1024:.1f} KiB), opset {args.opset}")
+
+    # --- ORT verification with synthetic warp-like input ---
+    import onnxruntime as ort
+
+    rng = np.random.default_rng(0)
+    rgb = rng.random((H, W, 3), dtype=np.float32)
+    depth = np.full((H, W, 1), 0.8, dtype=np.float32)
+    mask = np.zeros((H, W, 1), dtype=np.float32)
+    mask[H // 2 - 32:H // 2 + 32, W // 2 - 32:W // 2 + 32] = 1.0  # square hole
+    rgb_in = rgb * (1.0 - mask)  # holes are zero, like the pull pass
+    prev = np.full((H, W, 1), 0.5, dtype=np.float32)
+    x = np.concatenate([rgb_in, depth, mask, prev], axis=-1)
+    x = np.transpose(x, (2, 0, 1))[None].astype(np.float32)
+
+    sess = ort.InferenceSession(args.out, providers=["CPUExecutionProvider"])
+    out = sess.run(None, {"input": x})[0]
+    assert out.shape == (1, 3, H, W), f"unexpected shape {out.shape}"
+    assert np.all(np.isfinite(out)), "non-finite outputs"
+    print(f"[ort] output shape {out.shape}, range "
+          f"[{out.min():.4f}, {out.max():.4f}], providers {sess.get_providers()}")
+
+    # Blur-init check on valid pixels: model output ~= box blur of input RGB.
+    pred = np.transpose(out[0], (1, 2, 0))
+    ref = reference_box_blur(rgb_in)
+    valid = (mask[..., 0] < 0.5)
+    # Gate sigmoid(2)=0.881 attenuates; compare up to that scale factor.
+    scale = float(1.0 / (1.0 + np.exp(-2.0)))
+    mae = np.abs(pred[valid] / scale - ref[valid]).mean()
+    print(f"[ort] valid-pixel MAE vs box blur (gate-compensated): {mae:.5f}")
+    assert mae < 0.02, f"blur init diverged (mae={mae})"
+
+    # Timing smoke (NOT representative: ARM CPU, ORT CPU EP).
+    for _ in range(5):
+        sess.run(None, {"input": x})
+    t0 = time.perf_counter()
+    n = 20
+    for _ in range(n):
+        sess.run(None, {"input": x})
+    ms = (time.perf_counter() - t0) / n * 1000
+    print(f"[ort] CPU smoke timing: {ms:.1f} ms/infer at {W}x{H} "
+          f"(see README for 3060 TensorRT numbers)")
+
+    print("BLUR EXPORT: PASS")
+
+
+if __name__ == "__main__":
+    main()
