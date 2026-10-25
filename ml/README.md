@@ -76,20 +76,20 @@ git clone <repo> && cd xplane-reproject/openwarp
 git checkout feat/ml
 mise install && mise run setup-cuda
 git pull                                     # pick up this fix on the 3060 clone
-ml/.venv/bin/python ml/export_blur.py --ort torch   # zero-new-deps GPU number first
-ml/.venv/bin/python ml/export_blur.py --ort cuda    # then the ORT CUDA EP number
+ml/.venv/bin/python ml/export_blur.py --ort torch      # torch eager fp32/fp16
+ml/.venv/bin/python ml/export_blur.py --ort inductor   # torch.compile fused fp16
+ml/.venv/bin/python ml/export_blur.py --ort iobind     # ORT CUDA, device-resident
 ```
 
-Optional TensorRT number (ships with TensorRT 10):
-
-```
-trtexec --onnx=ml/weights/fill_blur_init.onnx --fp16 \
-  --shapes=input:2x6x1024x1280 --avgRuns=200
-```
+No TensorRT/trtexec needed: pip's TensorRT wheel ships no `trtexec`
+binary and there is no Ubuntu 26 CUDA-12 TensorRT build. The fused-kernel
+number comes from `--ort inductor` (Triton, ships with torch); the
+no-copy EP number from `--ort iobind`. Both need zero new installs.
 
 Target: whole fill (preprocess + infer + composite) comfortably under ~2 ms
-at half-res stereo. If fp16 lands <1 ms, there is headroom for the trained
-UNet (downsample levels + skips) that lands next.
+at half-res stereo. The `--ort inductor` fused-fp16 number is the gate: if it
+lands <1 ms, there is headroom for the trained UNet (downsample levels +
+skips) that lands next.
 
 ## Next steps (not in this commit)
 
