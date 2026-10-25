@@ -10,6 +10,11 @@
 # Re-running is safe: configure carries the cached ONNXRUNTIME_ROOT, and a
 # missing/invalid root simply falls back to the mock NN backend (never a
 # broken build). Use --clean if CMake ever complains about stale cache.
+#
+# Hermetic CUDA runtime: when ORT C++ is enabled, build.sh symlinks the
+# pip-pinned NVIDIA libs (from the mise venv) next to the provider .so
+# and bakes $ORIGIN into its RUNPATH via patchelf — no LD_LIBRARY_PATH,
+# no sudo/ldconfig, gamemode-proof. Needs: patchelf installed.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -64,6 +69,55 @@ cmake -B build "${CMAKE_ARGS[@]}" > build/cmake-configure.log 2>&1 || {
 }
 grep -E "CMAKE_BUILD_TYPE|onnxruntime C\+\+" build/cmake-configure.log || true
 cmake --build build --target openwarp_vulkan_shaders openwarp-vulkan-test openwarp
+
+# Hermetic CUDA runtime: the provider .so carries no RUNPATH, so its
+# DT_NEEDED (cublas/cudart/curand) and its lazy dlopen()s (cublasLt,
+# libcudnn.so by bare soname) ignore LD_LIBRARY_PATH games under
+# sandboxed launchers. Fix it in the artifact, not the environment:
+# symlink the pip-pinned NVIDIA libs next to it and bake $ORIGIN into
+# its RUNPATH with patchelf. Zero env vars, zero sudo, survives
+# gamemode. Re-runs are no-ops when links + RUNPATH are already right.
+if grep -q "ONNXRUNTIME_LIB:FILEPATH=.*libonnxruntime" build/CMakeCache.txt; then
+	ORT_LIB="$(dirname "$(grep ONNXRUNTIME_LIB:FILEPATH build/CMakeCache.txt | cut -d= -f2)")"
+	PROVIDER="$ORT_LIB/libonnxruntime_providers_cuda.so"
+	if [ -f "$PROVIDER" ]; then
+		VENVDIR=""
+		for v in "${VIRTUAL_ENV:-}" "$PWD/ml/.venv" "$PWD/../ml/.venv"; do
+			[ -n "$v" ] || continue
+			for d in "$v"/lib/python*/site-packages/nvidia; do
+				[ -d "$d" ] && VENVDIR="$d" && break 2
+			done
+		done
+		if [ -z "$VENVDIR" ]; then
+			echo "note: no venv nvidia/ dir found; CUDA EP keeps system search order" >&2
+		elif ! command -v patchelf >/dev/null 2>&1; then
+			echo "note: patchelf missing (sudo apt install patchelf); skipping hermetic CUDA staging" >&2
+		else
+			need_libs="cublas/lib/libcublasLt.so.13 cublas/lib/libcublas.so.13 cuda_runtime/lib/libcudart.so.13 curand/lib/libcurand.so.10 cudnn/lib/libcudnn.so.9"
+			staged=0
+			for rel in $need_libs; do
+				base="$(basename "$rel")"
+				src="$VENVDIR/$rel"
+				if [ -f "$src" ] && [ ! -e "$ORT_LIB/$base" ]; then
+					ln -s "$src" "$ORT_LIB/$base"
+					echo "staged $base"
+					staged=1
+				fi
+			done
+			if [ ! -e "$ORT_LIB/libcudnn.so" ]; then
+				ln -s "$VENVDIR/cudnn/lib/libcudnn.so.9" "$ORT_LIB/libcudnn.so"
+				echo "staged libcudnn.so"
+				staged=1
+			fi
+			if ! readelf -d "$PROVIDER" | grep -qE "RUNPATH.*\\\$ORIGIN|RPATH.*\\\$ORIGIN"; then
+				patchelf --set-rpath '$ORIGIN' "$PROVIDER"
+				echo "patched RUNPATH=\$ORIGIN into $(basename "$PROVIDER")"
+				staged=1
+			fi
+			[ "$staged" = 0 ] && echo "CUDA runtime staging: already hermetic"
+		fi
+	fi
+fi
 
 echo "---"
 echo "build type : $(grep CMAKE_BUILD_TYPE:STRING build/CMakeCache.txt | cut -d= -f2)"
