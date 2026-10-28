@@ -39,7 +39,7 @@ layout(set = 0, binding = 3, rgba8) uniform writeonly image2D dstImg;
 
 layout(push_constant) uniform Push
 {
-	int fillMode; // 0 = black holes, 1 = JFA background blur
+	int fillMode; // 0 = black holes, 1 = JFA background blur, 2 = donor copy (diagnostic smear)
 } pc;
 
 #define VALID_EPS (0.5 / 255.0)
@@ -139,8 +139,11 @@ void main()
 		imageStore(dstImg, xy, vec4(v.rgb / v.a, 1.0));
 		return;
 	}
-	// Hole: mode 0 (and unknown modes) leave black.
-	if (pc.fillMode != 1) {
+	// Hole: mode 0 (and unknown modes) leave black. Mode 2 (donor
+	// copy, diagnostic) skips blur/erode/dilation and stores the
+	// donor texel verbatim below: smear instead of blur, so donor
+	// selection mistakes show up starkly instead of hiding as tint.
+	if (pc.fillMode != 1 && pc.fillMode != 2) {
 		imageStore(dstImg, xy, vec4(0.0));
 		return;
 	}
@@ -161,6 +164,20 @@ void main()
 		return;
 	}
 	float donorDepth = float(donorEnc) / DEPTH_SCALE;
+
+	// Diagnostic donor copy (mode 2): verbatim donor texel, no blur, no
+	// erode, no dilation (dilation above only runs for mode 1). Smear
+	// instead of blur: a wrong (foreground) donor shows up as a stark
+	// white streak rather than a soft tint.
+	if (pc.fillMode == 2) {
+		vec4 dt = imageLoad(srcImg, donor);
+		if (dt.a >= VALID_EPS) {
+			imageStore(dstImg, xy, vec4(dt.rgb / dt.a, 1.0));
+			return;
+		}
+		imageStore(dstImg, xy, vec4(0.0));
+		return;
+	}
 
 	// Function-scope accumulators (lavapipe reads back block-scope
 	// loop-carried initializers stale; see warp_pull.comp note).

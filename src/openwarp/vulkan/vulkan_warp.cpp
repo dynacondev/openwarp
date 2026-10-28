@@ -1117,9 +1117,9 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 	Multiply(dstInvV, dstInvP, pullUbo.dstInv);
 	Multiply(srcProj, viewSrc, pullUbo.srcVP);
 	// holeRadius > 0 enables hole filling; 0 keeps disocclusions black
-	// regardless of fillMode. Mode 1 (JFA background blur) builds the
-	// donor plane below.
-	bool wantJfa = (fillMode_ == 1 && holeRadius > 0.0f);
+	// regardless of fillMode. Mode 1 (JFA background blur) and mode 2
+	// (donor copy, diagnostic smear) build the donor plane below.
+	bool wantJfa = (fillMode_ == 1 || fillMode_ == 2) && holeRadius > 0.0f;
 	std::memcpy(s->uboSplat.mapped, &splatUbo, sizeof(splatUbo));
 	std::memcpy(s->uboPull.mapped, &pullUbo, sizeof(pullUbo));
 

@@ -932,6 +932,45 @@ int main(int argc, char** argv)
 			}
 			stbi_write_png((outDir + "/oracle_fill.png").c_str(), kSize, kSize, 4, checkOut1.data(),
 			               kSize * 4);
+
+			// Mode 2 (donor copy, diagnostic): verbatim donor texel, no
+			// blur to hide behind. White outside the analytic foreground
+			// interval means the flood handed a hole a foreground donor:
+			// unclean smear. Expect FAIL until seeds stop admitting
+			// foreground interiors.
+			warp.SetFillMode(2);
+			std::vector<uint8_t> checkOut2;
+			if (!warp.Warp(identity, proj, small, proj, 1.0f, checkOut2, false)) {
+				std::cerr << "checker donor Warp() failed" << std::endl;
+				return 1;
+			}
+			size_t donorWhiteOutside = 0;
+			size_t donorBlack = 0;
+			for (int y = 112; y < 144; y++) {
+				for (int x = 0; x < (int)kSize; x++) {
+					size_t i = (size_t)y * kSize + (size_t)x;
+					bool black = (checkOut2[4 * i] == 0 && checkOut2[4 * i + 1] == 0 &&
+					              checkOut2[4 * i + 2] == 0);
+					if (black) {
+						donorBlack++;
+						continue;
+					}
+					if (x >= expFgL - 1 && x <= expFgR + 1)
+						continue;
+					bool white = (checkOut2[4 * i] > 240 && checkOut2[4 * i + 1] > 240 &&
+					              checkOut2[4 * i + 2] > 240);
+					if (white)
+						donorWhiteOutside++;
+				}
+			}
+			std::cout << "[oracle-donor] whiteOutside=" << donorWhiteOutside
+			          << " black=" << donorBlack << std::endl;
+			if (!(donorWhiteOutside == 0)) {
+				std::cerr << "FAIL: donor copy smeared foreground into holes" << std::endl;
+				ok = false;
+			}
+			stbi_write_png((outDir + "/oracle_donor.png").c_str(), kSize, kSize, 4,
+			               checkOut2.data(), kSize * 4);
 		}
 		stbi_write_png((outDir + "/fringe_fill.png").c_str(), kSize, kSize, 4, fringeFill.data(),
 		               kSize * 4);

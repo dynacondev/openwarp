@@ -76,10 +76,12 @@ public:
 	// Hole-fill selector for the fill pass (warp_fill.comp push
 	// constant). 0 = holes stay black; 1 = JFA background blur (nearest
 	// background seed via jump-flood + full-res 5x5 depth-gated blur
-	// around the donor). Any other value falls back to 0 in-shader
-	// (unknown modes must never produce garbage). Kept as the switch
-	// point for future fill methods: add a mode here, branch on it in
-	// warp_fill.comp, done. Takes effect on the next Warp().
+	// around the donor); 2 = donor copy (diagnostic: verbatim donor
+	// texel, smear instead of blur — wrong donors show up starkly).
+	// Any other value falls back to 0 in-shader (unknown modes must
+	// never produce garbage). Kept as the switch point for future fill
+	// methods: add a mode here, branch on it in warp_fill.comp, done.
+	// Takes effect on the next Warp().
 	void SetFillMode(int m) { fillMode_ = m; }
 
 	// Warp the uploaded frame from (srcPose, srcProj) to
