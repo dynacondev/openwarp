@@ -229,8 +229,10 @@ int main(int argc, char** argv)
 		std::cerr << "FAIL: JFA fill did not reduce holes vs black" << std::endl;
 		ok = false;
 	}
-	// Valid pixels must be bit-exact vs mode 0 (fill never touches them),
-	// and filled holes must be background (never white foreground smear,
+	// Valid pixels must be bit-exact vs mode 0 except for the
+	// dilation ring (valid in pull, black in mode-0 output, refilled
+	// in mode 1): those show up as holes below, never as mismatches.
+	// Filled holes must be background (never white foreground smear,
 	// never left black).
 	{
 		size_t validMismatch = 0;
@@ -338,6 +340,25 @@ int main(int argc, char** argv)
 			std::cerr << "FAIL: foreground fringe in fill (maxExcess<=1, over10==0 required)"
 			          << std::endl;
 			ok = false;
+		}
+		// Full-image gate: the square moved fully off-screen, so every
+		// output pixel must be flat 100 — including the 1px valid ring
+		// the old code left fringe-tinted next to holes (hole-masked
+		// metrics cannot see it; this one fails pre-fix with dev 34).
+		{
+			int fullMaxDev = 0;
+			for (size_t i = 0; i < fringeFill.size() / 4; i++) {
+				for (int c = 0; c < 3; c++) {
+					int dev = std::abs((int)fringeFill[4 * i + c] - 100);
+					if (dev > fullMaxDev)
+						fullMaxDev = dev;
+				}
+			}
+			std::cout << "[fringe] fullImageMaxDev=" << fullMaxDev << std::endl;
+			if (!(fullMaxDev <= 1)) {
+				std::cerr << "FAIL: full-image fringe (dev<=1 required)" << std::endl;
+				ok = false;
+			}
 		}
 		stbi_write_png((outDir + "/fringe_fill.png").c_str(), kSize, kSize, 4, fringeFill.data(),
 		               kSize * 4);
