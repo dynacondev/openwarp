@@ -35,6 +35,9 @@ build/
 
 # Output folder
 output/
+vulkan-test-out/
+vulkan-dump-*.ppm
+vulkan-dump-*.pgm
 
 # Compiled shaders
 *.spv
