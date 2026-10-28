@@ -3,39 +3,112 @@
  *
  * Part of the Openwarp project, NCSA licensed (see LICENSE).
  *
- * Black-hole fill only: valid pull pixels (alpha >= eps) are
- * un-premultiplied, holes keep the pull result (black). The fillMode
- * push constant is the switch point for future fill methods (0 =
- * black; unknown modes fall back to 0 and never produce garbage).
+ * Mode 0 (black): valid pull pixels (alpha >= eps) are
+ * un-premultiplied, holes keep the pull result (black).
+ * Mode 1 (JFA background blur): holes look up their nearest
+ * background seed from the JFA pass (warp_jfa_init/flood) and take a
+ * full-res 5x5 validity-weighted average around the donor, rejecting
+ * foreground-side taps by depth. Isotropic blur (never a single-texel
+ * smear), full-res taps (no coarse-mip blocks), O(log N) flood cost
+ * independent of hole width. Unknown modes fall back to 0 and never
+ * produce garbage.
+ *
+ * Double-buffered: reads pull output from srcImg, writes to dstImg
+ * (different images). Same-dispatch neighbor reads would otherwise race
+ * hole-vs-hole fills (undefined by the Vulkan memory model).
  */
 
 #version 450
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(set = 0, binding = 0, rgba8) uniform image2D dstImg;
-// Reserved for future depth-aware fills; unused by the black-hole pass
-// but kept so the set layout stays stable when fills land.
-layout(set = 0, binding = 1, r32ui) uniform uimage2D splatDepth;
+// Pull output (read-only stable snapshot for this dispatch).
+layout(set = 0, binding = 0, rgba8) uniform readonly image2D srcImg;
+// Foreground/background depth plane from the splat pass; mode 1 gates
+// blur taps against the donor depth so foreground never leaks in.
+// Keep DEPTH_TOL in sync with warp_jfa_init.comp (same value, seed
+// classification vs gather gating).
+layout(set = 0, binding = 1, r32ui) uniform readonly uimage2D splatDepth;
+// JFA result: packed (x << 16) | y background donor per pixel,
+// PACK_EMPTY when no background seed reached (<65536px axes, always
+// true within Vulkan maxImageDimension2D). Unused by mode 0 but kept
+// bound so the set layout stays stable.
+layout(set = 0, binding = 2, r32ui) uniform readonly uimage2D jfaSeed;
+// Fill output (write-only, distinct image from srcImg).
+layout(set = 0, binding = 3, rgba8) uniform writeonly image2D dstImg;
 
 layout(push_constant) uniform Push
 {
-	int fillMode; // 0 = black holes (only implemented mode)
+	int fillMode; // 0 = black holes, 1 = JFA background blur
 } pc;
 
 #define VALID_EPS (0.5 / 255.0)
+#define SPLAT_EMPTY 0xffffffffu
+#define PACK_EMPTY 0xffffffffu
+#define DEPTH_SCALE 16777215.0
+// Foreground rejection width, nonlinear 0..1 depth units: taps this
+// much shallower than the donor fade out. Far-plane slopes vary slowly
+// in nonlinear space, so 0.02 keeps genuine background while killing
+// the occluder.
+#define DEPTH_TOL 0.02
 
 void main()
 {
 	ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
-	ivec2 size = imageSize(dstImg);
+	ivec2 size = imageSize(srcImg);
 	if (xy.x >= size.x || xy.y >= size.y)
 		return;
-	vec4 v = imageLoad(dstImg, xy);
+	vec4 v = imageLoad(srcImg, xy);
 	if (v.a >= VALID_EPS) {
 		imageStore(dstImg, xy, vec4(v.rgb / v.a, 1.0));
 		return;
 	}
-	// Hole: leave black regardless of fillMode (future fills branch here).
-	imageStore(dstImg, xy, vec4(0.0));
+	// Hole: mode 0 (and unknown modes) leave black.
+	if (pc.fillMode != 1) {
+		imageStore(dstImg, xy, vec4(0.0));
+		return;
+	}
+
+	uint pack = imageLoad(jfaSeed, xy).x;
+	if (pack == PACK_EMPTY) {
+		imageStore(dstImg, xy, vec4(0.0));
+		return;
+	}
+	ivec2 donor = ivec2(int(pack >> 16), int(pack & 0xffffu));
+	if (donor.x < 0 || donor.y < 0 || donor.x >= size.x || donor.y >= size.y) {
+		imageStore(dstImg, xy, vec4(0.0));
+		return;
+	}
+	uint donorEnc = imageLoad(splatDepth, donor).x;
+	if (donorEnc == SPLAT_EMPTY) {
+		imageStore(dstImg, xy, vec4(0.0));
+		return;
+	}
+	float donorDepth = float(donorEnc) / DEPTH_SCALE;
+
+	// Function-scope accumulators (lavapipe reads back block-scope
+	// loop-carried initializers stale; see warp_pull.comp note).
+	vec3 sum = vec3(0.0);
+	float wsum = 0.0;
+	for (int oy = -2; oy <= 2; oy++) {
+		for (int ox = -2; ox <= 2; ox++) {
+			ivec2 sxy = clamp(donor + ivec2(ox, oy), ivec2(0), size - ivec2(1));
+			uint e = imageLoad(splatDepth, sxy).x;
+			if (e != SPLAT_EMPTY) {
+				float d = float(e) / DEPTH_SCALE;
+				if (d >= donorDepth - DEPTH_TOL) {
+					vec4 t = imageLoad(srcImg, sxy);
+					if (t.a >= VALID_EPS) {
+						sum += t.rgb / t.a;
+						wsum += 1.0;
+					}
+				}
+			}
+		}
+	}
+	if (wsum < 0.5) {
+		imageStore(dstImg, xy, vec4(0.0));
+		return;
+	}
+	imageStore(dstImg, xy, vec4(sum / wsum, 1.0));
 }

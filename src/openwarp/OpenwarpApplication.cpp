@@ -28,20 +28,25 @@ const char* OpenwarpApplication::VulkanFillName(VulkanFillMethod m)
 {
     switch (m) {
     case VulkanFillMethod::Off: return "Off (black)";
+    case VulkanFillMethod::BgBlur: return "Background blur (JFA)";
     default: return "<unknown>";
     }
 }
 
 OpenwarpApplication::VulkanFillMethod OpenwarpApplication::VulkanFillByIndex(int i)
 {
-    (void)i;
-    return VulkanFillMethod::Off;
+    switch (i) {
+    case 0: return VulkanFillMethod::Off;
+    case 1: return VulkanFillMethod::BgBlur;
+    default: return VulkanFillMethod::Off;
+    }
 }
 
 int OpenwarpApplication::VulkanFillIndex(VulkanFillMethod m)
 {
     switch (m) {
     case VulkanFillMethod::Off: return 0;
+    case VulkanFillMethod::BgBlur: return 1;
     default: return 0;
     }
 }
@@ -58,10 +63,10 @@ void OpenwarpApplication::CycleVulkanFill(int dir)
 float OpenwarpApplication::VulkanFillHoleRadius() const
 {
     // Maps the fill selector onto the VulkanWarp::Warp() holeRadius
-    // knob. Only Off exists, so holes always stay black; future fills
-    // return >0 here. HoleRadius stays plumbed so new methods slot in
-    // without touching the Warp() call.
+    // knob. Off returns 0 (honest black); BgBlur returns >0 to run the
+    // JFA donor plane + blurred gather.
     switch (vulkanFill) {
+    case VulkanFillMethod::BgBlur: return 1.0f;
     case VulkanFillMethod::Off:
     default: return 0.0f;
     }
@@ -69,9 +74,10 @@ float OpenwarpApplication::VulkanFillHoleRadius() const
 
 int OpenwarpApplication::VulkanFillMode() const
 {
-    // Maps onto the warp_fill.comp fillMode push constant (switch point
-    // for future fills; only 0 = black is implemented).
+    // Maps onto the warp_fill.comp fillMode push constant (0 = black,
+    // 1 = JFA background blur).
     switch (vulkanFill) {
+    case VulkanFillMethod::BgBlur: return 1;
     case VulkanFillMethod::Off:
     default: return 0;
     }
@@ -370,8 +376,8 @@ void OpenwarpApplication::drawGUI(){
         ImGui::End();
     }
 
-    // Vulkan-only window: lists the fill method radios (only Off while
-    // fills are stripped) so the switch infra stays live for the next
+    // Vulkan-only window: lists the fill method radios (Off + JFA
+    // background blur) so the switch infra stays live for the next
     // fill. To add a fill: append a VulkanFillMethod value + its tuning
     // widgets here.
     if (showVulkanFillConfig && isVulkan) {

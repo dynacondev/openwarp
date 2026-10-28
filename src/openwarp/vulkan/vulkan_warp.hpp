@@ -56,7 +56,8 @@ public:
 	VulkanWarp(const VulkanWarp&) = delete;
 	VulkanWarp& operator=(const VulkanWarp&) = delete;
 
-	// Loads warp_splat.spv / warp_pull.spv / warp_fill.spv from spvDir,
+	// Loads warp_splat.spv / warp_pull.spv / warp_fill.spv plus
+	// warp_jfa_init.spv / warp_jfa_flood.spv from spvDir,
 	// creates the device, images and pipelines. Returns false on failure
 	// (with the reason in *error when non-null). glRenderer (from
 	// glGetString(GL_RENDERER), may be null) steers device selection
@@ -73,18 +74,21 @@ public:
 	bool Upload(const uint8_t* colorRGBA, const float* depth);
 
 	// Hole-fill selector for the fill pass (warp_fill.comp push
-	// constant). Only 0 is implemented (holes stay black); any other
-	// value falls back to 0 in-shader (unknown modes must never produce
-	// garbage). Kept as the switch point for future fill methods:
-	// add a mode here, branch on it in warp_fill.comp, done. Takes
-	// effect on the next Warp().
+	// constant). 0 = holes stay black; 1 = JFA background blur (nearest
+	// background seed via jump-flood + full-res 5x5 depth-gated blur
+	// around the donor). Any other value falls back to 0 in-shader
+	// (unknown modes must never produce garbage). Kept as the switch
+	// point for future fill methods: add a mode here, branch on it in
+	// warp_fill.comp, done. Takes effect on the next Warp().
 	void SetFillMode(int m) { fillMode_ = m; }
 
 	// Warp the uploaded frame from (srcPose, srcProj) to
 	// (dstPose, dstProj) and download the RGB8 result into outColor
-	// (width*height*4 bytes). holeRadius is reserved for future fills
-	// (>0 will build/sample extra data); currently holes always stay
-	// black, so pass 0. srcProj/dstProj are PerspectiveGL/FrustumGL
+	// (width*height*4 bytes). holeRadius selects hole filling: 0 leaves
+	// disocclusions black (honest baseline); >0 runs the SetFillMode
+	// variant (1 = JFA background blur). Filled regions are the
+	// validity-weighted mean around the background donor (blurred,
+	// never stretched). srcProj/dstProj are PerspectiveGL/FrustumGL
 	// matrices; near/far must match between the two (same convention
 	// as dynacon-vr). countCoverage also downloads the splat plane
 	// and counts filled texels (extra copy in the SAME submit, plus a

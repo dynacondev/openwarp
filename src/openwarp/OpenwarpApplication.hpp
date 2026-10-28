@@ -116,8 +116,9 @@ class Openwarp::OpenwarpApplication{
         // dispatch lives in doVulkanMeshWarp().
         enum class VulkanFillMethod : int {
             Off = 0, // holes stay black (honest baseline for A/B)
+            BgBlur = 1, // JFA background blur (nearest BG donor + 5x5 blur)
         };
-        static constexpr int kVulkanFillCount = 1;
+        static constexpr int kVulkanFillCount = 2;
         static VulkanFillMethod VulkanFillByIndex(int i);
         static int VulkanFillIndex(VulkanFillMethod m);
         static const char* VulkanFillName(VulkanFillMethod m);

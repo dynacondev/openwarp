@@ -1,0 +1,63 @@
+/*
+ * Openwarp Vulkan compute warp, JFA flood step (nearest background seed).
+ *
+ * Part of the Openwarp project, NCSA licensed (see LICENSE).
+ *
+ * One Jump-Flooding pass: each pixel checks 8 neighbors at push-constant
+ * distance `step` plus itself, keeping the seed closest to itself.
+ * Seeds are packed coords (x << 16) | y from warp_jfa_init.comp;
+ * PACK_EMPTY never wins. Run with step = maxDim/2 ... 1 (10 passes at
+ * 1024) ping-ponging between two images; cost is O(log N) independent
+ * of hole width.
+ */
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, r32ui) uniform readonly uimage2D jfaSrc;
+layout(set = 0, binding = 1, r32ui) uniform writeonly uimage2D jfaDst;
+
+layout(push_constant) uniform Push
+{
+	int step;
+} pc;
+
+#define PACK_EMPTY 0xffffffffu
+
+ivec2 unpackCoord(uint p)
+{
+	return ivec2(int(p >> 16), int(p & 0xffffu));
+}
+
+void main()
+{
+	ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 size = imageSize(jfaDst);
+	if (xy.x >= size.x || xy.y >= size.y)
+		return;
+
+	// Function scope: lavapipe reads back block-scope loop-carried
+	// state stale (see warp_pull.comp note).
+	uint bestPack = PACK_EMPTY;
+	float bestDist = 1e30;
+
+	for (int oy = -1; oy <= 1; oy++) {
+		for (int ox = -1; ox <= 1; ox++) {
+			ivec2 sxy = xy + ivec2(ox * pc.step, oy * pc.step);
+			if (sxy.x >= 0 && sxy.y >= 0 && sxy.x < size.x && sxy.y < size.y) {
+				uint p = imageLoad(jfaSrc, sxy).x;
+				if (p != PACK_EMPTY) {
+					ivec2 seed = unpackCoord(p);
+					vec2 d = vec2(seed - xy);
+					float dist = dot(d, d);
+					if (dist < bestDist) {
+						bestDist = dist;
+						bestPack = p;
+					}
+				}
+			}
+		}
+	}
+	imageStore(jfaDst, xy, uvec4(bestPack));
+}

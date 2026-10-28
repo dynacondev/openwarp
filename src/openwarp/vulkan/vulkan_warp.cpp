@@ -129,10 +129,10 @@ struct VulkanWarp::State {
 		VkDeviceMemory memory = VK_NULL_HANDLE;
 		VkImageView view = VK_NULL_HANDLE;
 		VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
-		// Single-level images only (warp target included: no mip chain
-		// while only the black-hole fill exists).
+		// Single-level images only (warp target included: the JFA seed
+		// planes are single-level R32_UINT donor coords).
 		std::vector<VkImageLayout> levels;
-	} srcColor, srcDepth, splat, dst;
+	} srcColor, srcDepth, splat, dst, dst2, jfaA, jfaB;
 
 	struct Buffer {
 		VkBuffer handle = VK_NULL_HANDLE;
@@ -146,16 +146,25 @@ struct VulkanWarp::State {
 	VkDescriptorSetLayout splatLayout = VK_NULL_HANDLE;
 	VkDescriptorSetLayout pullLayout = VK_NULL_HANDLE;
 	VkDescriptorSetLayout fillLayout = VK_NULL_HANDLE;
+	VkDescriptorSetLayout jfaInitLayout = VK_NULL_HANDLE;
+	VkDescriptorSetLayout jfaFloodLayout = VK_NULL_HANDLE;
 	VkDescriptorPool descPool = VK_NULL_HANDLE;
 	VkDescriptorSet splatSet = VK_NULL_HANDLE;
 	VkDescriptorSet pullSet = VK_NULL_HANDLE;
 	VkDescriptorSet fillSet = VK_NULL_HANDLE;
+	VkDescriptorSet jfaInitSet = VK_NULL_HANDLE;
+	VkDescriptorSet jfaFloodABSet = VK_NULL_HANDLE;
+	VkDescriptorSet jfaFloodBASet = VK_NULL_HANDLE;
 	VkPipelineLayout splatPipeLayout = VK_NULL_HANDLE;
 	VkPipelineLayout pullPipeLayout = VK_NULL_HANDLE;
 	VkPipelineLayout fillPipeLayout = VK_NULL_HANDLE;
+	VkPipelineLayout jfaInitPipeLayout = VK_NULL_HANDLE;
+	VkPipelineLayout jfaFloodPipeLayout = VK_NULL_HANDLE;
 	VkPipeline splatPipe = VK_NULL_HANDLE;
 	VkPipeline pullPipe = VK_NULL_HANDLE;
 	VkPipeline fillPipe = VK_NULL_HANDLE;
+	VkPipeline jfaInitPipe = VK_NULL_HANDLE;
+	VkPipeline jfaFloodPipe = VK_NULL_HANDLE;
 
 	// Optional GPU timestamp queries (stage timing). Created when the
 	// queue family supports them; all use is guarded by hasTimestamps.
@@ -605,12 +614,27 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 	                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
 	                 s->splat, error))
 		return false;
-	// Warp target: single level, storage + download. The fill pass only
-	// normalizes valid pixels (black-hole fill); no mip chain needed.
+	// Warp target: single level. dst holds the pull output (fill
+	// source); dst2 is the double-buffered fill output (fill reads
+	// neighbors while writing, so same-image in-place would race
+	// hole-vs-hole). Mode 1 (JFA background blur) also reads the JFA
+	// donor plane in the fill pass.
+	if (!CreateImage(s, width, height, VK_FORMAT_R8G8B8A8_UNORM,
+	                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+	                 s->dst, error, 1))
+		return false;
 	if (!CreateImage(s, width, height, VK_FORMAT_R8G8B8A8_UNORM,
 	                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
 	                         VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-	                 s->dst, error, 1))
+	                 s->dst2, error, 1))
+		return false;
+	// JFA seed planes: packed (x << 16) | y background donor coords,
+	// PACK_EMPTY when no seed. Ping-ponged by the flood passes.
+	if (!CreateImage(s, width, height, VK_FORMAT_R32_UINT,
+	                 VK_IMAGE_USAGE_STORAGE_BIT, s->jfaA, error))
+		return false;
+	if (!CreateImage(s, width, height, VK_FORMAT_R32_UINT,
+	                 VK_IMAGE_USAGE_STORAGE_BIT, s->jfaB, error))
 		return false;
 
 	// Buffers: UBOs + one staging buffer. Staging holds TWO planes
@@ -701,20 +725,50 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 	           error))
 		return false;
 
-	// Fill layout: dst storage (read-write) + splat storage (reserved
-	// for future depth-aware fills; unused by the black-hole pass but
-	// keeps the set layout stable).
-	VkDescriptorSetLayoutBinding fillBindings[2]{};
-	for (uint32_t i = 0; i < 2; i++) {
+	// Fill layout: 0 dst pull output (read-only snapshot), 1 splat
+	// depth gate, 2 JFA donor plane, 3 fill output (write-only, distinct
+	// image: same-dispatch neighbor reads would otherwise race
+	// hole-vs-hole).
+	VkDescriptorSetLayoutBinding fillBindings[4]{};
+	for (uint32_t i = 0; i < 4; i++) {
 		fillBindings[i].binding = i;
 		fillBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 		fillBindings[i].descriptorCount = 1;
 		fillBindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 	}
-	li.bindingCount = 2;
+	li.bindingCount = 4;
 	li.pBindings = fillBindings;
 	if (!Check(vkCreateDescriptorSetLayout(s->device, &li, nullptr, &s->fillLayout), "fill layout",
 	           error))
+		return false;
+
+	// JFA init layout: splat depth in, donor plane out.
+	VkDescriptorSetLayoutBinding jfaInitBindings[2]{};
+	for (uint32_t i = 0; i < 2; i++) {
+		jfaInitBindings[i].binding = i;
+		jfaInitBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+		jfaInitBindings[i].descriptorCount = 1;
+		jfaInitBindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	}
+	li.bindingCount = 2;
+	li.pBindings = jfaInitBindings;
+	if (!Check(vkCreateDescriptorSetLayout(s->device, &li, nullptr, &s->jfaInitLayout),
+	           "jfa init layout", error))
+		return false;
+
+	// JFA flood layout: donor plane in/out (two sets cover both
+	// ping-pong directions so no per-pass descriptor update is needed).
+	VkDescriptorSetLayoutBinding jfaFloodBindings[2]{};
+	for (uint32_t i = 0; i < 2; i++) {
+		jfaFloodBindings[i].binding = i;
+		jfaFloodBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+		jfaFloodBindings[i].descriptorCount = 1;
+		jfaFloodBindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	}
+	li.bindingCount = 2;
+	li.pBindings = jfaFloodBindings;
+	if (!Check(vkCreateDescriptorSetLayout(s->device, &li, nullptr, &s->jfaFloodLayout),
+	           "jfa flood layout", error))
 		return false;
 
 	VkDescriptorPoolSize poolSizes[3]{};
@@ -723,10 +777,11 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 	poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 	poolSizes[1].descriptorCount = 2;
 	poolSizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-	poolSizes[2].descriptorCount = 5; // splat, pull x2, fill x2
+	// splat 1 + pull 2 + fill 4 + jfaInit 2 + floodAB 2 + floodBA 2
+	poolSizes[2].descriptorCount = 13;
 	VkDescriptorPoolCreateInfo dpi{};
 	dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-	dpi.maxSets = 3;
+	dpi.maxSets = 6;
 	dpi.poolSizeCount = 3;
 	dpi.pPoolSizes = poolSizes;
 	if (!Check(vkCreateDescriptorPool(s->device, &dpi, nullptr, &s->descPool), "desc pool", error))
@@ -743,6 +798,17 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 		return false;
 	alloc.pSetLayouts = &s->fillLayout;
 	if (!Check(vkAllocateDescriptorSets(s->device, &alloc, &s->fillSet), "alloc fill set", error))
+		return false;
+	alloc.pSetLayouts = &s->jfaInitLayout;
+	if (!Check(vkAllocateDescriptorSets(s->device, &alloc, &s->jfaInitSet), "alloc jfa init set",
+	           error))
+		return false;
+	alloc.pSetLayouts = &s->jfaFloodLayout;
+	if (!Check(vkAllocateDescriptorSets(s->device, &alloc, &s->jfaFloodABSet), "alloc jfa AB set",
+	           error))
+		return false;
+	if (!Check(vkAllocateDescriptorSets(s->device, &alloc, &s->jfaFloodBASet), "alloc jfa BA set",
+	           error))
 		return false;
 
 	auto writeCombined = [&](VkDescriptorSet set, uint32_t binding, VkSampler sampler,
@@ -796,16 +862,27 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 	writeStorage(s->pullSet, 3, s->dst.view);
 	writeStorage(s->fillSet, 0, s->dst.view);
 	writeStorage(s->fillSet, 1, s->splat.view);
+	writeStorage(s->fillSet, 2, s->jfaA.view);
+	writeStorage(s->fillSet, 3, s->dst2.view);
+	writeStorage(s->jfaInitSet, 0, s->splat.view);
+	writeStorage(s->jfaInitSet, 1, s->jfaA.view);
+	writeStorage(s->jfaFloodABSet, 0, s->jfaA.view);
+	writeStorage(s->jfaFloodABSet, 1, s->jfaB.view);
+	writeStorage(s->jfaFloodBASet, 0, s->jfaB.view);
+	writeStorage(s->jfaFloodBASet, 1, s->jfaA.view);
 
 	// Pipelines.
-	std::vector<uint32_t> splatSpv, pullSpv, fillSpv;
+	std::vector<uint32_t> splatSpv, pullSpv, fillSpv, jfaInitSpv, jfaFloodSpv;
 	if (!LoadSpv(spvDir + "/warp_splat.spv", splatSpv, error) ||
 	    !LoadSpv(spvDir + "/warp_pull.spv", pullSpv, error) ||
-	    !LoadSpv(spvDir + "/warp_fill.spv", fillSpv, error))
+	    !LoadSpv(spvDir + "/warp_fill.spv", fillSpv, error) ||
+	    !LoadSpv(spvDir + "/warp_jfa_init.spv", jfaInitSpv, error) ||
+	    !LoadSpv(spvDir + "/warp_jfa_flood.spv", jfaFloodSpv, error))
 		return false;
 	std::cout << "[vulkan] SPIR-V: warp_splat.spv " << splatSpv.size() * 4 << " bytes, warp_pull.spv "
 	          << pullSpv.size() * 4 << " bytes, warp_fill.spv " << fillSpv.size() * 4
-	          << " bytes" << std::endl;
+	          << " bytes, warp_jfa_init.spv " << jfaInitSpv.size() * 4
+	          << " bytes, warp_jfa_flood.spv " << jfaFloodSpv.size() * 4 << " bytes" << std::endl;
 	auto makePipe = [&](const std::vector<uint32_t>& spv, VkDescriptorSetLayout layout,
 	                    VkPipelineLayout& pipeLayout, VkPipeline& pipe, const char* what,
 	                    uint32_t pushSize = 0) {
@@ -843,12 +920,19 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 	if (!makePipe(pullSpv, s->pullLayout, s->pullPipeLayout, s->pullPipe, "pull pipeline"))
 		return false;
 	if (!makePipe(fillSpv, s->fillLayout, s->fillPipeLayout, s->fillPipe, "fill pipeline",
-	              sizeof(int32_t))) // int fillMode (reserved switch point)
+	              sizeof(int32_t))) // int fillMode (0 black, 1 JFA blur)
+		return false;
+	if (!makePipe(jfaInitSpv, s->jfaInitLayout, s->jfaInitPipeLayout, s->jfaInitPipe,
+	              "jfa init pipeline"))
+		return false;
+	if (!makePipe(jfaFloodSpv, s->jfaFloodLayout, s->jfaFloodPipeLayout, s->jfaFloodPipe,
+	              "jfa flood pipeline", sizeof(int32_t))) // int step
 		return false;
 
 	// Timestamp queries: 0 submit-start, 1 after clear, 2 after splat,
-	// 3 after pull, 4 unused (kept for stable indices), 5 after fill,
-	// 6 after dst copy. Optional; guarded everywhere.
+	// 3 after pull, 4 after JFA (== 3 when fill off, kept for stable
+	// indices), 5 after fill, 6 after dst copy. JFA time folds into
+	// fillMs. Optional; guarded everywhere.
 	{
 		uint32_t qCount = 0;
 		vkGetPhysicalDeviceQueueFamilyProperties(s->phys, &qCount, nullptr);
@@ -896,12 +980,20 @@ void VulkanWarp::Shutdown()
 			vkDestroyPipeline(s->device, s->pullPipe, nullptr);
 		if (s->fillPipe)
 			vkDestroyPipeline(s->device, s->fillPipe, nullptr);
+		if (s->jfaInitPipe)
+			vkDestroyPipeline(s->device, s->jfaInitPipe, nullptr);
+		if (s->jfaFloodPipe)
+			vkDestroyPipeline(s->device, s->jfaFloodPipe, nullptr);
 		if (s->splatPipeLayout)
 			vkDestroyPipelineLayout(s->device, s->splatPipeLayout, nullptr);
 		if (s->pullPipeLayout)
 			vkDestroyPipelineLayout(s->device, s->pullPipeLayout, nullptr);
 		if (s->fillPipeLayout)
 			vkDestroyPipelineLayout(s->device, s->fillPipeLayout, nullptr);
+		if (s->jfaInitPipeLayout)
+			vkDestroyPipelineLayout(s->device, s->jfaInitPipeLayout, nullptr);
+		if (s->jfaFloodPipeLayout)
+			vkDestroyPipelineLayout(s->device, s->jfaFloodPipeLayout, nullptr);
 		if (s->descPool)
 			vkDestroyDescriptorPool(s->device, s->descPool, nullptr);
 		if (s->splatLayout)
@@ -910,6 +1002,10 @@ void VulkanWarp::Shutdown()
 			vkDestroyDescriptorSetLayout(s->device, s->pullLayout, nullptr);
 		if (s->fillLayout)
 			vkDestroyDescriptorSetLayout(s->device, s->fillLayout, nullptr);
+		if (s->jfaInitLayout)
+			vkDestroyDescriptorSetLayout(s->device, s->jfaInitLayout, nullptr);
+		if (s->jfaFloodLayout)
+			vkDestroyDescriptorSetLayout(s->device, s->jfaFloodLayout, nullptr);
 		if (s->colorSampler)
 			vkDestroySampler(s->device, s->colorSampler, nullptr);
 		if (s->depthSampler)
@@ -937,6 +1033,9 @@ void VulkanWarp::Shutdown()
 		freeImg(s->srcDepth);
 		freeImg(s->splat);
 		freeImg(s->dst);
+		freeImg(s->dst2);
+		freeImg(s->jfaA);
+		freeImg(s->jfaB);
 		if (s->fence)
 			vkDestroyFence(s->device, s->fence, nullptr);
 		if (s->pool)
@@ -1012,7 +1111,10 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 	Multiply(dstProj, viewDst, splatUbo.warpVP);
 	Multiply(dstInvV, dstInvP, pullUbo.dstInv);
 	Multiply(srcProj, viewSrc, pullUbo.srcVP);
-	(void)holeRadius; // reserved: no fill methods yet, holes stay black.
+	// holeRadius > 0 enables hole filling; 0 keeps disocclusions black
+	// regardless of fillMode. Mode 1 (JFA background blur) builds the
+	// donor plane below.
+	bool wantJfa = (fillMode_ == 1 && holeRadius > 0.0f);
 	std::memcpy(s->uboSplat.mapped, &splatUbo, sizeof(splatUbo));
 	std::memcpy(s->uboPull.mapped, &pullUbo, sizeof(pullUbo));
 
@@ -1040,8 +1142,18 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 	           VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
 	           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
-	// Dst target into GENERAL for storage writes.
+	// Dst target into GENERAL for storage writes (pull output).
 	Transition(s, s->dst, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
+	           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+	// Fill output into GENERAL. Fill reads dst + neighbors while writing
+	// dst2, so the double buffer removes the hole-vs-hole race.
+	Transition(s, s->dst2, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
+	           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+	// JFA seed planes into GENERAL (fill mode 0 never samples binding 2,
+	// but the descriptor stays bound so the layout must be valid).
+	Transition(s, s->jfaA, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
+	           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+	Transition(s, s->jfaB, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
 	           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
 	uint32_t gx = (width_ + 7) / 8;
@@ -1068,32 +1180,89 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 	if (s->hasTimestamps)
 		vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 3);
 
-	// No mip chain while only the black-hole fill exists: keep query
-	// index 4 stable for the timing struct.
+	// JFA donor plane (mode 1 only): seed background texels, then
+	// jump-flood log2(maxDim) passes ping-ponging A<->B with an even
+	// pass count so the result always lands back in jfaA for the fill.
+	// Cost is O(log N) independent of hole width. JFA time folds into
+	// fillMs (query 4 marks the JFA end).
+	if (wantJfa) {
+		vkCmdBindPipeline(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s->jfaInitPipe);
+		vkCmdBindDescriptorSets(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s->jfaInitPipeLayout,
+		                        0, 1, &s->jfaInitSet, 0, nullptr);
+		vkCmdDispatch(s->cmd, gx, gy, 1);
+		vkCmdPipelineBarrier(s->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+		                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memBar, 0, nullptr,
+		                     0, nullptr);
+
+		uint32_t maxDim = width_ > height_ ? width_ : height_;
+		int step = 1;
+		while ((uint32_t)(step * 2) < maxDim)
+			step *= 2;
+		bool ping = true; // true: A->B, false: B->A
+		for (; step >= 1; step /= 2) {
+			vkCmdBindPipeline(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s->jfaFloodPipe);
+			VkDescriptorSet floodSet = ping ? s->jfaFloodABSet : s->jfaFloodBASet;
+			vkCmdBindDescriptorSets(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+			                        s->jfaFloodPipeLayout, 0, 1, &floodSet, 0, nullptr);
+			int32_t step32 = (int32_t)step;
+			vkCmdPushConstants(s->cmd, s->jfaFloodPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+			                   sizeof(step32), &step32);
+			vkCmdDispatch(s->cmd, gx, gy, 1);
+			vkCmdPipelineBarrier(s->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memBar, 0,
+			                     nullptr, 0, nullptr);
+			ping = !ping;
+		}
+		// Keep the result in jfaA for the fill (fillSet binding 2 is
+		// written once at Init): an odd pass count ends in B, so fold
+		// one extra step-1 pass (idempotent for JFA) to land back in A.
+		if (!ping) {
+			vkCmdBindPipeline(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s->jfaFloodPipe);
+			vkCmdBindDescriptorSets(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+			                        s->jfaFloodPipeLayout, 0, 1, &s->jfaFloodBASet, 0,
+			                        nullptr);
+			int32_t step32 = 1;
+			vkCmdPushConstants(s->cmd, s->jfaFloodPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+			                   sizeof(step32), &step32);
+			vkCmdDispatch(s->cmd, gx, gy, 1);
+			vkCmdPipelineBarrier(s->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+			                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memBar, 0,
+			                     nullptr, 0, nullptr);
+		}
+	}
 	if (s->hasTimestamps)
 		vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 4);
 
-	// Fill always runs: valid pixels are un-premultiplied here, holes
-	// stay black. The fillMode push constant is the switch point for
-	// future fills (currently only 0 = black is implemented).
+	// Pull writes dst; fill reads it (mode 0 directly, mode 1 via the
+	// JFA-gated blur). Same-queue dispatch order is not memory
+	// visibility: barrier unconditionally so the black path is covered
+	// too (the JFA block's own barriers only exist when wantJfa).
+	vkCmdPipelineBarrier(s->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memBar, 0, nullptr,
+	                     0, nullptr);
+
+	// Fill always runs into dst2 (double-buffered): valid pixels are
+	// un-premultiplied here. Mode 0 (or holeRadius 0) leaves holes
+	// black; mode 1 reads the JFA donor plane and blurs full-res
+	// background around the donor.
 	vkCmdBindPipeline(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s->fillPipe);
 	vkCmdBindDescriptorSets(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s->fillPipeLayout, 0, 1,
 	                        &s->fillSet, 0, nullptr);
-	int32_t fillMode = fillMode_;
+	int32_t fillMode = wantJfa ? fillMode_ : 0;
 	vkCmdPushConstants(s->cmd, s->fillPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
 	                   sizeof(fillMode), &fillMode);
 	vkCmdDispatch(s->cmd, gx, gy, 1);
 	if (s->hasTimestamps)
 		vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 5);
 
-	// Read back dst (and the splat plane for coverage, same submit).
-	Transition(s, s->dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
+	// Read back dst2 (and the splat plane for coverage, same submit).
+	Transition(s, s->dst2, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
 	           VK_PIPELINE_STAGE_TRANSFER_BIT);
 	VkDeviceSize colorBytes = static_cast<VkDeviceSize>(width_) * height_ * 4;
 	VkBufferImageCopy copy{};
 	copy.imageExtent = {width_, height_, 1};
 	copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-	vkCmdCopyImageToBuffer(s->cmd, s->dst.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	vkCmdCopyImageToBuffer(s->cmd, s->dst2.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 	                       s->staging.handle, 1, &copy);
 	if (countCoverage) {
 		// Splat copy lands at staging offset colorBytes (staging is
@@ -1108,7 +1277,7 @@ bool VulkanWarp::Warp(const Pose& srcPose, const Mat4 srcProj, const Pose& dstPo
 		                       s->staging.handle, 1, &copySplat);
 	}
 	if (s->hasTimestamps)
-	vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 6);
+		vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->queryPool, 6);
 	if (!SubmitWait(s, &lastError_)) {
 		if (lastError_.empty())
 			lastError_ = "Warp: submit/wait failed";
