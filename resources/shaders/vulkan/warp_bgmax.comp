@@ -1,0 +1,75 @@
+/*
+ * Openwarp Vulkan compute warp, coarse background-max (seed reference).
+ *
+ * Part of the Openwarp project, NCSA licensed (see LICENSE).
+ *
+ * One thread per coarse texel (BGMAX_CELL x BGMAX_CELL source block):
+ * max splat depth over the block's BORDER ring, skipping EMPTY. The
+ * border (not the full block) is the representative surrounding layer:
+ * a full-block max would grab unrepresentative extremes (e.g. a sky
+ * sliver through a gap) and suppress the mid-ground that actually
+ * surrounds the region. EMPTY (holes) must be skipped explicitly: the
+ * sentinel 0xffffffff decodes as far, so a naive max would reference
+ * sky for every hole-adjacent cell. All-EMPTY block -> EMPTY (unused:
+ * seed init early-outs on EMPTY own depth first, so no seed can read
+ * it). Encodings compare directly (monotonic in depth, no float
+ * conversion needed).
+ */
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, r32ui) uniform readonly uimage2D splatDepth;
+layout(set = 0, binding = 1, r32ui) uniform writeonly uimage2D bgMax;
+
+#define SPLAT_EMPTY 0xffffffffu
+#define BGMAX_CELL 64
+
+void main()
+{
+	ivec2 cxy = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 csize = imageSize(bgMax);
+	if (cxy.x >= csize.x || cxy.y >= csize.y)
+		return;
+	ivec2 size = imageSize(splatDepth);
+	ivec2 base = cxy * BGMAX_CELL;
+
+	// Function-scope accumulator (lavapipe reads back block-scope
+	// loop-carried initializers stale; see the note in warp_pull).
+	uint best = 0u;
+	bool any = false;
+	for (int ox = 0; ox < BGMAX_CELL; ox++) {
+		ivec2 sxy = clamp(base + ivec2(ox, 0), ivec2(0), size - ivec2(1));
+		uint e = imageLoad(splatDepth, sxy).x;
+		if (e != SPLAT_EMPTY && (!any || e > best)) {
+			best = e;
+			any = true;
+		}
+		sxy = clamp(base + ivec2(ox, BGMAX_CELL - 1), ivec2(0), size - ivec2(1));
+		e = imageLoad(splatDepth, sxy).x;
+		if (e != SPLAT_EMPTY && (!any || e > best)) {
+			best = e;
+			any = true;
+		}
+	}
+	for (int oy = 1; oy < BGMAX_CELL - 1; oy++) {
+		ivec2 sxy = clamp(base + ivec2(0, oy), ivec2(0), size - ivec2(1));
+		uint e = imageLoad(splatDepth, sxy).x;
+		if (e != SPLAT_EMPTY && (!any || e > best)) {
+			best = e;
+			any = true;
+		}
+		sxy = clamp(base + ivec2(BGMAX_CELL - 1, oy), ivec2(0), size - ivec2(1));
+		e = imageLoad(splatDepth, sxy).x;
+		if (e != SPLAT_EMPTY && (!any || e > best)) {
+			best = e;
+			any = true;
+		}
+	}
+	if (!any) {
+		imageStore(bgMax, cxy, uvec4(SPLAT_EMPTY));
+		return;
+	}
+	imageStore(bgMax, cxy, uvec4(best));
+}

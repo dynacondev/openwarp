@@ -11,9 +11,14 @@
  * edge).
  *
  * A seed is background when its own depth is within DEPTH_TOL of the
- * deepest valid splat in a 5x5 window around itself. The window only
- * produces one scalar threshold per pixel (never color), so it cannot
- * paint blocky color edges; color stays full-res in the fill pass.
+ * coarse perimeter-max reference (bgMax, one texel per BGMAX_CELL
+ * block): the deepest layer surrounding the region at occluder-exceeding
+ * scale. The old 5x5 local max is gone: it is strictly weaker (its
+ * window sits inside the coarse cell, so everything it rejected the
+ * coarse test rejects too) and it cannot tell foreground interiors
+ * from background interiors (both are locally deepest in their own
+ * 5x5). A lone local test lets whole foreground objects seed; the
+ * coarse test does not, unless the occluder fills an entire cell.
  * Keep DEPTH_TOL in sync with warp_fill.comp (same value, seed
  * classification vs gather gating).
  */
@@ -24,11 +29,15 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, r32ui) uniform readonly uimage2D splatDepth;
 layout(set = 0, binding = 1, r32ui) uniform writeonly uimage2D jfaDst;
+// Coarse background reference: perimeter-max splat depth per
+// BGMAX_CELL block (see warp_bgmax.comp). Must match BGMAX_CELL there.
+layout(set = 0, binding = 2, r32ui) uniform readonly uimage2D bgMax;
 
 #define SPLAT_EMPTY 0xffffffffu
 #define PACK_EMPTY 0xffffffffu
 #define DEPTH_SCALE 16777215.0
 #define DEPTH_TOL 0.02
+#define BGMAX_CELL 64
 
 uint packCoord(ivec2 p)
 {
@@ -49,22 +58,14 @@ void main()
 	}
 	float depth = float(enc) / DEPTH_SCALE;
 
-	// Function-scope accumulator (lavapipe reads back block-scope
-	// loop-carried initializers stale; see warp_pull.comp note).
-	float bgDepth = depth;
-	for (int oy = -2; oy <= 2; oy++) {
-		for (int ox = -2; ox <= 2; ox++) {
-			ivec2 sxy = clamp(xy + ivec2(ox, oy), ivec2(0), size - ivec2(1));
-			uint e = imageLoad(splatDepth, sxy).x;
-			if (e != SPLAT_EMPTY) {
-				float d = float(e) / DEPTH_SCALE;
-				if (d > bgDepth)
-					bgDepth = d;
-			}
-		}
+	uint ref = imageLoad(bgMax, xy / BGMAX_CELL).x;
+	if (ref == SPLAT_EMPTY) {
+		imageStore(jfaDst, xy, uvec4(PACK_EMPTY));
+		return;
 	}
+	float bgRef = float(ref) / DEPTH_SCALE;
 
-	if (depth >= bgDepth - DEPTH_TOL)
+	if (depth >= bgRef - DEPTH_TOL)
 		imageStore(jfaDst, xy, uvec4(packCoord(xy)));
 	else
 		imageStore(jfaDst, xy, uvec4(PACK_EMPTY));

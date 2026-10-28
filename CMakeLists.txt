@@ -99,7 +99,8 @@ if(OPENWARP_ENABLE_VULKAN)
                 "${OPENWARP_SPV_DIR}/warp_pull.spv"
                 "${OPENWARP_SPV_DIR}/warp_fill.spv"
                 "${OPENWARP_SPV_DIR}/warp_jfa_init.spv"
-                "${OPENWARP_SPV_DIR}/warp_jfa_flood.spv")
+                "${OPENWARP_SPV_DIR}/warp_jfa_flood.spv"
+                "${OPENWARP_SPV_DIR}/warp_bgmax.spv")
             add_custom_command(
                 OUTPUT "${OPENWARP_SPV_DIR}/warp_splat.spv"
                 COMMAND "${OPENWARP_GLSLC}" --target-env=vulkan1.0 -O
@@ -135,6 +136,13 @@ if(OPENWARP_ENABLE_VULKAN)
                         -o "${OPENWARP_SPV_DIR}/warp_jfa_flood.spv"
                 DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/resources/shaders/vulkan/warp_jfa_flood.comp"
                 COMMENT "Compiling warp_jfa_flood.comp")
+            add_custom_command(
+                OUTPUT "${OPENWARP_SPV_DIR}/warp_bgmax.spv"
+                COMMAND "${OPENWARP_GLSLC}" --target-env=vulkan1.0 -O
+                        "${CMAKE_CURRENT_SOURCE_DIR}/resources/shaders/vulkan/warp_bgmax.comp"
+                        -o "${OPENWARP_SPV_DIR}/warp_bgmax.spv"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/resources/shaders/vulkan/warp_bgmax.comp"
+                COMMENT "Compiling warp_bgmax.comp")
             add_custom_target(openwarp_vulkan_shaders ALL DEPENDS ${OPENWARP_SPV})
 
             # Headless compute warp library (Option B port).
