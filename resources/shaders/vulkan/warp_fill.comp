@@ -51,6 +51,11 @@ layout(push_constant) uniform Push
 // in nonlinear space, so 0.02 keeps genuine background while killing
 // the occluder.
 #define DEPTH_TOL 0.02
+// Dilation color gate (straight-rgb, 0..1): a hole-adjacent valid pixel
+// is refilled only when it differs from a valid neighbor by more than
+// this. Fringe/overshoot (~+0.13 in the flat-100 rig) trips it;
+// minification cracks and screen borders (identical neighbors) do not.
+#define DILATE_COLOR_TOL (8.0 / 255.0)
 
 void main()
 {
@@ -59,7 +64,76 @@ void main()
 	if (xy.x >= size.x || xy.y >= size.y)
 		return;
 	vec4 v = imageLoad(srcImg, xy);
-	if (v.a >= VALID_EPS) {
+	bool hole = (v.a < VALID_EPS);
+	// Hole dilation: valid pixels adjacent to holes are reclassified
+	// as holes when they disagree in color with their valid neighbors.
+	// Point splats overshoot foreground by ~1px into the disocclusion
+	// (falsely-valid strip) and bilinear pull tints the neighboring
+	// valid background ring; both are baked in upstream of fill (valid
+	// alpha) with background-consistent depth, so a depth gate cannot
+	// catch them and only refilling from interior background cures it.
+	// The color gate preserves minification cracks and screen edges
+	// (neighbors identical) exactly, and the 1px refilled ring doubles
+	// as an edge blend. Identity frames have no holes, so they are
+	// unaffected.
+	if (!hole) {
+		uint ownEnc = imageLoad(splatDepth, xy).x;
+		if (ownEnc != SPLAT_EMPTY) {
+			bool nextToHole = false;
+			ivec2 nxy = clamp(xy + ivec2(1, 0), ivec2(0), size - ivec2(1));
+			if (imageLoad(splatDepth, nxy).x == SPLAT_EMPTY)
+				nextToHole = true;
+			nxy = clamp(xy + ivec2(-1, 0), ivec2(0), size - ivec2(1));
+			if (imageLoad(splatDepth, nxy).x == SPLAT_EMPTY)
+				nextToHole = true;
+			nxy = clamp(xy + ivec2(0, 1), ivec2(0), size - ivec2(1));
+			if (imageLoad(splatDepth, nxy).x == SPLAT_EMPTY)
+				nextToHole = true;
+			nxy = clamp(xy + ivec2(0, -1), ivec2(0), size - ivec2(1));
+			if (imageLoad(splatDepth, nxy).x == SPLAT_EMPTY)
+				nextToHole = true;
+			if (nextToHole) {
+				// Color gate: compare against valid neighbors only.
+				// No valid neighbors (isolated speck) or a genuine
+				// discontinuity means refilling; identical
+				// surroundings mean the pixel is trustworthy.
+				vec3 ownC = v.rgb / max(v.a, VALID_EPS);
+				float cmax = 0.0;
+				int nvalid = 0;
+				vec4 t0 = imageLoad(srcImg, clamp(xy + ivec2(1, 0), ivec2(0),
+				                                 size - ivec2(1)));
+				if (t0.a >= VALID_EPS) {
+					nvalid++;
+					vec3 dd = abs(t0.rgb / t0.a - ownC);
+					cmax = max(cmax, max(dd.r, max(dd.g, dd.b)));
+				}
+				t0 = imageLoad(srcImg, clamp(xy + ivec2(-1, 0), ivec2(0),
+				                             size - ivec2(1)));
+				if (t0.a >= VALID_EPS) {
+					nvalid++;
+					vec3 dd = abs(t0.rgb / t0.a - ownC);
+					cmax = max(cmax, max(dd.r, max(dd.g, dd.b)));
+				}
+				t0 = imageLoad(srcImg, clamp(xy + ivec2(0, 1), ivec2(0),
+				                             size - ivec2(1)));
+				if (t0.a >= VALID_EPS) {
+					nvalid++;
+					vec3 dd = abs(t0.rgb / t0.a - ownC);
+					cmax = max(cmax, max(dd.r, max(dd.g, dd.b)));
+				}
+				t0 = imageLoad(srcImg, clamp(xy + ivec2(0, -1), ivec2(0),
+				                             size - ivec2(1)));
+				if (t0.a >= VALID_EPS) {
+					nvalid++;
+					vec3 dd = abs(t0.rgb / t0.a - ownC);
+					cmax = max(cmax, max(dd.r, max(dd.g, dd.b)));
+				}
+				if (nvalid == 0 || cmax > DILATE_COLOR_TOL)
+					hole = true;
+			}
+		}
+	}
+	if (!hole) {
 		imageStore(dstImg, xy, vec4(v.rgb / v.a, 1.0));
 		return;
 	}
@@ -132,6 +206,34 @@ void main()
 		}
 	}
 	if (wsum < 0.5) {
+		// Starvation fallback (narrow background gaps where erosion
+		// rejects every tap): retry un-eroded but still depth-gated so
+		// foreground never leaks, then the donor texel itself, and only
+		// then black. Black speckles inside filled bands are far more
+		// visible than a slight fringe tint.
+		for (int oy = -2; oy <= 2; oy++) {
+			for (int ox = -2; ox <= 2; ox++) {
+				ivec2 sxy = clamp(donor + ivec2(ox, oy), ivec2(0), size - ivec2(1));
+				uint e = imageLoad(splatDepth, sxy).x;
+				if (e != SPLAT_EMPTY) {
+					float d = float(e) / DEPTH_SCALE;
+					if (d >= donorDepth - DEPTH_TOL) {
+						vec4 t = imageLoad(srcImg, sxy);
+						if (t.a >= VALID_EPS) {
+							sum += t.rgb / t.a;
+							wsum += 1.0;
+						}
+					}
+				}
+			}
+		}
+	}
+	if (wsum < 0.5) {
+		vec4 dt = imageLoad(srcImg, donor);
+		if (dt.a >= VALID_EPS) {
+			imageStore(dstImg, xy, vec4(dt.rgb / dt.a, 1.0));
+			return;
+		}
 		imageStore(dstImg, xy, vec4(0.0));
 		return;
 	}
