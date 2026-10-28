@@ -50,6 +50,34 @@ void BuildSynthetic(std::vector<uint8_t>& color, std::vector<float>& depth)
 	}
 }
 
+// Flat mid-gray background + white foreground square. The gradient
+// scene above hides partial foreground mixing (128 gray + white fringe
+// = ~180, below the >240 white gate). Flat 100 gray makes any bilinear
+// pull fringe or gather reach show up as excess brightness in filled
+// holes: ideal fill is exactly 100.
+void BuildFlat(std::vector<uint8_t>& color, std::vector<float>& depth)
+{
+	color.resize(kSize * kSize * 4);
+	depth.resize(kSize * kSize);
+	for (uint32_t y = 0; y < kSize; y++) {
+		for (uint32_t x = 0; x < kSize; x++) {
+			size_t i = y * kSize + x;
+			color[4 * i + 0] = 100;
+			color[4 * i + 1] = 100;
+			color[4 * i + 2] = 100;
+			color[4 * i + 3] = 255;
+			depth[i] = 0.8f;
+			if (x >= kSize / 2 - 32 && x < kSize / 2 + 32 && y >= kSize / 2 - 32 &&
+			    y < kSize / 2 + 32) {
+				color[4 * i + 0] = 255;
+				color[4 * i + 1] = 255;
+				color[4 * i + 2] = 255;
+				depth[i] = 0.2f;
+			}
+		}
+	}
+}
+
 double MeanAbsDiff(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b)
 {
 	double acc = 0;
@@ -255,6 +283,60 @@ int main(int argc, char** argv)
 	               kSize * 4);
 	stbi_write_png((outDir + "/jfa_identity.png").c_str(), kSize, kSize, 4, jfaIdOut.data(),
 	               kSize * 4);
+
+	// Test 5: foreground-fringe rig. Flat 100-gray background + white
+	// square, shifted pose, JFA fill. Reports only (no FAIL gate yet):
+	// any filled-hole brightness above flat 100 is foreground dragged
+	// in via bilinear pull fringe or gather reach across the edge.
+	{
+		std::vector<uint8_t> flatBgColor;
+		std::vector<float> flatBgDepth;
+		BuildFlat(flatBgColor, flatBgDepth);
+		if (!warp.Upload(flatBgColor.data(), flatBgDepth.data())) {
+			std::cerr << "fringe Upload failed" << std::endl;
+			return 1;
+		}
+		warp.SetFillMode(0);
+		std::vector<uint8_t> fringeBlack;
+		if (!warp.Warp(identity, proj, shifted, proj, 0.0f, fringeBlack, false)) {
+			std::cerr << "fringe black Warp() failed" << std::endl;
+			return 1;
+		}
+		warp.SetFillMode(1);
+		std::vector<uint8_t> fringeFill;
+		if (!warp.Warp(identity, proj, shifted, proj, 1.0f, fringeFill, false)) {
+			std::cerr << "fringe fill Warp() failed" << std::endl;
+			return 1;
+		}
+		size_t holes = 0;
+		double maxExcess = 0.0;
+		double sumExcess = 0.0;
+		size_t over10 = 0;
+		size_t over30 = 0;
+		for (size_t i = 0; i < fringeBlack.size() / 4; i++) {
+			bool hole = (fringeBlack[4 * i] == 0 && fringeBlack[4 * i + 1] == 0 &&
+			             fringeBlack[4 * i + 2] == 0);
+			if (!hole)
+				continue;
+			holes++;
+			double peak = (fringeFill[4 * i] + fringeFill[4 * i + 1] + fringeFill[4 * i + 2]) / 3.0;
+			double excess = peak - 100.0;
+			if (excess > maxExcess)
+				maxExcess = excess;
+			if (excess > 0)
+				sumExcess += excess;
+			if (excess > 10.0)
+				over10++;
+			if (excess > 30.0)
+				over30++;
+		}
+		double meanExcess = holes ? sumExcess / (double)holes : 0.0;
+		std::cout << "[fringe] holes=" << holes << " maxExcess=" << maxExcess
+		          << " meanExcess=" << meanExcess << " over10=" << over10 << " over30=" << over30
+		          << std::endl;
+		stbi_write_png((outDir + "/fringe_fill.png").c_str(), kSize, kSize, 4, fringeFill.data(),
+		               kSize * 4);
+	}
 	std::cout << (ok ? "VULKAN WARP TEST: PASS" : "VULKAN WARP TEST: FAIL") << std::endl;
 	return ok ? 0 : 1;
 }
