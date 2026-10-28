@@ -285,9 +285,9 @@ int main(int argc, char** argv)
 	               kSize * 4);
 
 	// Test 5: foreground-fringe rig. Flat 100-gray background + white
-	// square, shifted pose, JFA fill. Reports only (no FAIL gate yet):
-	// any filled-hole brightness above flat 100 is foreground dragged
-	// in via bilinear pull fringe or gather reach across the edge.
+	// square, shifted pose, JFA fill. Filled-hole brightness above flat
+	// 100 is foreground dragged in via bilinear pull fringe or gather
+	// reach across the edge: the eroded gather must keep it at zero.
 	{
 		std::vector<uint8_t> flatBgColor;
 		std::vector<float> flatBgDepth;
@@ -334,6 +334,11 @@ int main(int argc, char** argv)
 		std::cout << "[fringe] holes=" << holes << " maxExcess=" << maxExcess
 		          << " meanExcess=" << meanExcess << " over10=" << over10 << " over30=" << over30
 		          << std::endl;
+		if (!(maxExcess <= 1.0 && over10 == 0)) {
+			std::cerr << "FAIL: foreground fringe in fill (maxExcess<=1, over10==0 required)"
+			          << std::endl;
+			ok = false;
+		}
 		stbi_write_png((outDir + "/fringe_fill.png").c_str(), kSize, kSize, 4, fringeFill.data(),
 		               kSize * 4);
 	}

@@ -97,10 +97,35 @@ void main()
 			if (e != SPLAT_EMPTY) {
 				float d = float(e) / DEPTH_SCALE;
 				if (d >= donorDepth - DEPTH_TOL) {
-					vec4 t = imageLoad(srcImg, sxy);
-					if (t.a >= VALID_EPS) {
-						sum += t.rgb / t.a;
-						wsum += 1.0;
+					// Erosion: the tap's 4-neighbors must all be
+					// background too. Background edge pixels carry
+					// bilinear pull fringe (foreground mixed into a
+					// background-depth texel), so averaging them
+					// drags foreground into the hole. Interior taps
+					// have clean color. Clamped at image borders.
+					bool interior = true;
+					ivec2 nxy = clamp(sxy + ivec2(1, 0), ivec2(0), size - ivec2(1));
+					uint ne = imageLoad(splatDepth, nxy).x;
+					if (ne == SPLAT_EMPTY || float(ne) / DEPTH_SCALE < donorDepth - DEPTH_TOL)
+						interior = false;
+					nxy = clamp(sxy + ivec2(-1, 0), ivec2(0), size - ivec2(1));
+					ne = imageLoad(splatDepth, nxy).x;
+					if (ne == SPLAT_EMPTY || float(ne) / DEPTH_SCALE < donorDepth - DEPTH_TOL)
+						interior = false;
+					nxy = clamp(sxy + ivec2(0, 1), ivec2(0), size - ivec2(1));
+					ne = imageLoad(splatDepth, nxy).x;
+					if (ne == SPLAT_EMPTY || float(ne) / DEPTH_SCALE < donorDepth - DEPTH_TOL)
+						interior = false;
+					nxy = clamp(sxy + ivec2(0, -1), ivec2(0), size - ivec2(1));
+					ne = imageLoad(splatDepth, nxy).x;
+					if (ne == SPLAT_EMPTY || float(ne) / DEPTH_SCALE < donorDepth - DEPTH_TOL)
+						interior = false;
+					if (interior) {
+						vec4 t = imageLoad(srcImg, sxy);
+						if (t.a >= VALID_EPS) {
+							sum += t.rgb / t.a;
+							wsum += 1.0;
+						}
 					}
 				}
 			}
