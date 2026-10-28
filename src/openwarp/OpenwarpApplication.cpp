@@ -29,6 +29,7 @@ const char* OpenwarpApplication::VulkanFillName(VulkanFillMethod m)
     switch (m) {
     case VulkanFillMethod::Off: return "Off (black)";
     case VulkanFillMethod::BgBlur: return "Background blur (JFA)";
+    case VulkanFillMethod::DonorSmear: return "Donor smear (JFA, diagnostic)";
     default: return "<unknown>";
     }
 }
@@ -38,6 +39,7 @@ OpenwarpApplication::VulkanFillMethod OpenwarpApplication::VulkanFillByIndex(int
     switch (i) {
     case 0: return VulkanFillMethod::Off;
     case 1: return VulkanFillMethod::BgBlur;
+    case 2: return VulkanFillMethod::DonorSmear;
     default: return VulkanFillMethod::Off;
     }
 }
@@ -47,6 +49,7 @@ int OpenwarpApplication::VulkanFillIndex(VulkanFillMethod m)
     switch (m) {
     case VulkanFillMethod::Off: return 0;
     case VulkanFillMethod::BgBlur: return 1;
+    case VulkanFillMethod::DonorSmear: return 2;
     default: return 0;
     }
 }
@@ -63,10 +66,11 @@ void OpenwarpApplication::CycleVulkanFill(int dir)
 float OpenwarpApplication::VulkanFillHoleRadius() const
 {
     // Maps the fill selector onto the VulkanWarp::Warp() holeRadius
-    // knob. Off returns 0 (honest black); BgBlur returns >0 to run the
-    // JFA donor plane + blurred gather.
+    // knob. Off returns 0 (honest black); BgBlur and DonorSmear return
+    // >0 to run the JFA donor plane (blurred vs verbatim fill).
     switch (vulkanFill) {
     case VulkanFillMethod::BgBlur: return 1.0f;
+    case VulkanFillMethod::DonorSmear: return 1.0f;
     case VulkanFillMethod::Off:
     default: return 0.0f;
     }
@@ -75,9 +79,10 @@ float OpenwarpApplication::VulkanFillHoleRadius() const
 int OpenwarpApplication::VulkanFillMode() const
 {
     // Maps onto the warp_fill.comp fillMode push constant (0 = black,
-    // 1 = JFA background blur).
+    // 1 = JFA background blur, 2 = donor copy diagnostic smear).
     switch (vulkanFill) {
     case VulkanFillMethod::BgBlur: return 1;
+    case VulkanFillMethod::DonorSmear: return 2;
     case VulkanFillMethod::Off:
     default: return 0;
     }
@@ -377,9 +382,9 @@ void OpenwarpApplication::drawGUI(){
     }
 
     // Vulkan-only window: lists the fill method radios (Off + JFA
-    // background blur) so the switch infra stays live for the next
-    // fill. To add a fill: append a VulkanFillMethod value + its tuning
-    // widgets here.
+    // background blur + donor-smear diagnostic) so the switch infra
+    // stays live for the next fill. To add a fill: append a
+    // VulkanFillMethod value + its tuning widgets here.
     if (showVulkanFillConfig && isVulkan) {
         ImGui::SetNextWindowPos(ImVec2(0, 1024), ImGuiCond_Once, ImVec2(0.0f, 1.0f));
         ImGui::SetNextWindowSize(ImVec2(300, 250), ImGuiCond_Always);
