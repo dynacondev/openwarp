@@ -147,8 +147,9 @@ uint8_t CheckerAt(int x, int y)
 // CPU mirror of warp_pull.comp: unproject (tuv, target-view depth) with
 // dstInv, reproject with srcVP. Returns false exactly when the shader
 // marks a hole (EMPTY handled by caller, behind-camera, out-of-bounds).
+// ez is the expected source depth for the consistency gate.
 bool CpuPullSuv(float tuvX, float tuvY, float zt, const float* dstInv, const float* srcVP,
-                float& suvX, float& suvY)
+                float& suvX, float& suvY, float& ez)
 {
 	float v[4] = {tuvX * 2.0f - 1.0f, tuvY * 2.0f - 1.0f, zt * 2.0f - 1.0f, 1.0f};
 	float w[4];
@@ -166,6 +167,7 @@ bool CpuPullSuv(float tuvX, float tuvY, float zt, const float* dstInv, const flo
 		return false;
 	suvX = x;
 	suvY = y;
+	ez = s[2] / s[3] * 0.5f + 0.5f;
 	return true;
 }
 
@@ -200,9 +202,11 @@ bool CpuSplatTarget(float srcX, float srcY, float z, const float* renderInvVP,
 	return true;
 }
 
-// Oracle for the checker scene under a given warp: expected output gray
-// for target pixel (tx,ty), or -1 (bilinear boundary blend: skip strict
-// check), or -2 (expect hole/black: EMPTY splat or suv out of bounds).
+// Oracle for the checker scene under depth-aware pull: expected output
+// gray for target pixel (tx,ty), or -2 (expect hole/black: EMPTY splat,
+// suv out of bounds, or no depth-consistent tap). Mirrors the shader's
+// 2x2 renormalized gather, so every pixel is strict (no boundary skip:
+// consistent taps agree by construction).
 int OracleChecker(int tx, int ty, uint32_t splatEnc, const float* dstInv, const float* srcVP)
 {
 	if (splatEnc == 0xffffffffu)
@@ -212,12 +216,15 @@ int OracleChecker(int tx, int ty, uint32_t splatEnc, const float* dstInv, const 
 	float zt = (float)splatEnc / 16777215.0f;
 	float suvX = 0.0f;
 	float suvY = 0.0f;
-	if (!CpuPullSuv(tuvX, tuvY, zt, dstInv, srcVP, suvX, suvY))
+	float ez = 0.0f;
+	if (!CpuPullSuv(tuvX, tuvY, zt, dstInv, srcVP, suvX, suvY, ez))
 		return -2;
 	float fx = suvX * (float)kSize - 0.5f;
 	float fy = suvY * (float)kSize - 0.5f;
 	int x0 = (int)std::floor(fx);
 	int y0 = (int)std::floor(fy);
+	float ax = fx - (float)x0;
+	float ay = fy - (float)y0;
 	auto at = [](int sx, int sy) -> int {
 		if (sx < 0)
 			sx = 0;
@@ -232,10 +239,37 @@ int OracleChecker(int tx, int ty, uint32_t splatEnc, const float* dstInv, const 
 			return 255;
 		return CheckerAt(sx, sy);
 	};
-	int c = at(x0, y0);
-	if (at(x0 + 1, y0) != c || at(x0, y0 + 1) != c || at(x0 + 1, y0 + 1) != c)
-		return -1;
-	return c;
+	auto depthAt = [](int sx, int sy) -> float {
+		if (sx < 0)
+			sx = 0;
+		if (sy < 0)
+			sy = 0;
+		if (sx >= (int)kSize)
+			sx = (int)kSize - 1;
+		if (sy >= (int)kSize)
+			sy = (int)kSize - 1;
+		if (sx >= (int)kSize / 2 - 32 && sx < (int)kSize / 2 + 32 && sy >= (int)kSize / 2 - 32 &&
+		    sy < (int)kSize / 2 + 32)
+			return 0.2f;
+		return 0.8f;
+	};
+	int c[2][2] = {{at(x0, y0), at(x0 + 1, y0)}, {at(x0, y0 + 1), at(x0 + 1, y0 + 1)}};
+	float w[2][2] = {{(1.0f - ax) * (1.0f - ay), ax * (1.0f - ay)},
+	                 {(1.0f - ax) * ay, ax * ay}};
+	float sum = 0.0f;
+	float wsum = 0.0f;
+	for (int oy = 0; oy <= 1; oy++) {
+		for (int ox = 0; ox <= 1; ox++) {
+			float d = depthAt(x0 + ox, y0 + oy);
+			if (std::fabs(d - ez) < 0.02f) {
+				sum += (float)c[oy][ox] * w[oy][ox];
+				wsum += w[oy][ox];
+			}
+		}
+	}
+	if (wsum <= 1e-6f)
+		return -2;
+	return (int)(sum / wsum + 0.5f);
 }
 
 } // namespace
@@ -758,7 +792,6 @@ int main(int argc, char** argv)
 			}
 			const std::vector<uint32_t> splat0 = warp.LastSplatPlane();
 			size_t mismatch = 0;
-			size_t boundary = 0;
 			size_t shown = 0;
 			for (int y = 0; y < (int)kSize; y++) {
 				for (int x = 0; x < (int)kSize; x++) {
@@ -776,8 +809,6 @@ int main(int argc, char** argv)
 							shown++;
 							mismatch++;
 						}
-					} else if (e == -1) {
-						boundary++;
 					} else {
 						for (int c = 0; c < 3; c++) {
 							if (std::abs((int)checkOut0[4 * i + c] - e) > 1) {
@@ -795,7 +826,7 @@ int main(int argc, char** argv)
 					}
 				}
 			}
-			std::cout << "[oracle] mismatch=" << mismatch << " boundarySkip=" << boundary << std::endl;
+			std::cout << "[oracle] mismatch=" << mismatch << std::endl;
 			if (!(mismatch == 0)) {
 				std::cerr << "FAIL: pull output deviates from analytic oracle" << std::endl;
 				ok = false;

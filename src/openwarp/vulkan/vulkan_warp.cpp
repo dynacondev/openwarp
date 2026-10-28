@@ -702,7 +702,7 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 	           "splat layout", error))
 		return false;
 
-	VkDescriptorSetLayoutBinding pullBindings[4]{};
+	VkDescriptorSetLayoutBinding pullBindings[5]{};
 	pullBindings[0].binding = 0;
 	pullBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 	pullBindings[0].descriptorCount = 1;
@@ -719,7 +719,11 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 	pullBindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 	pullBindings[3].descriptorCount = 1;
 	pullBindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-	li.bindingCount = 4;
+	pullBindings[4].binding = 4;
+	pullBindings[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	pullBindings[4].descriptorCount = 1;
+	pullBindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+	li.bindingCount = 5;
 	li.pBindings = pullBindings;
 	if (!Check(vkCreateDescriptorSetLayout(s->device, &li, nullptr, &s->pullLayout), "pull layout",
 	           error))
@@ -773,7 +777,7 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 
 	VkDescriptorPoolSize poolSizes[3]{};
 	poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	poolSizes[0].descriptorCount = 2; // splat depth, pull color
+	poolSizes[0].descriptorCount = 3; // splat depth, pull color, pull depth
 	poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 	poolSizes[1].descriptorCount = 2;
 	poolSizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -860,6 +864,7 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 	writeUniform(s->pullSet, 1, s->uboPull);
 	writeStorage(s->pullSet, 2, s->splat.view);
 	writeStorage(s->pullSet, 3, s->dst.view);
+	writeCombined(s->pullSet, 4, s->depthSampler, s->srcDepth.view);
 	writeStorage(s->fillSet, 0, s->dst.view);
 	writeStorage(s->fillSet, 1, s->splat.view);
 	writeStorage(s->fillSet, 2, s->jfaA.view);
