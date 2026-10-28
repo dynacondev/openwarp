@@ -65,6 +65,8 @@ void main()
 		return;
 	vec4 v = imageLoad(srcImg, xy);
 	bool hole = (v.a < VALID_EPS);
+	// Dilation runs only when filling (mode 1): mode 0 stays the pure
+	// pull mask for honest A/B and diagnosis.
 	// Hole dilation: valid pixels adjacent to holes are reclassified
 	// as holes when they disagree in color with their valid neighbors.
 	// Point splats overshoot foreground by ~1px into the disocclusion
@@ -76,7 +78,7 @@ void main()
 	// (neighbors identical) exactly, and the 1px refilled ring doubles
 	// as an edge blend. Identity frames have no holes, so they are
 	// unaffected.
-	if (!hole) {
+	if (!hole && pc.fillMode == 1) {
 		uint ownEnc = imageLoad(splatDepth, xy).x;
 		if (ownEnc != SPLAT_EMPTY) {
 			bool nextToHole = false;
