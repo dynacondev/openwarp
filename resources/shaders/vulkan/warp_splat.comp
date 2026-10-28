@@ -41,12 +41,14 @@ void main()
 	// lattice UVs here mean lod 0 anyway.
 	float z = textureLod(srcDepth, guv, 0.0).x;
 
-	// Far-plane clamp (mesh parity: openwarp_mesh.vert clamps NDC z to
-	// 0.99, i.e. window depth 0.995). Sky/clear pixels sit at exactly
-	// 1.0; without this, any backward motion pushes their reprojected
-	// target.z past 1.0 and the frustum reject below drops the whole
-	// background to black.
-	z = min(z, 0.995);
+	// Sky rule: clear pixels sit at exactly 1.0 (== far plane). Snap
+	// near-1.0 dust to exactly far; everything else passes through
+	// untouched. (A previous min(z, 0.995) here collapsed the whole
+	// 1.5 m..far range onto ~1.5 m: 0.995 sits at ~200x near whenever
+	// far>>near, as here. That made distant geometry swim with
+	// translation. Do not reintroduce a buffer-space clamp.)
+	if (z >= 1.0 - 1e-6)
+		z = 1.0;
 
 	vec4 clip = vec4(guv * 2.0 - 1.0, z * 2.0 - 1.0, 1.0);
 	vec4 world = ubo.renderInvVP * clip;
@@ -58,8 +60,11 @@ void main()
 		return;
 	target /= target.w;
 	// Outside the target frustum in depth: without this reject the
-	// out-of-range pixels splat clamped garbage.
-	if (target.z < -1.0 || target.z > 1.0)
+	// out-of-range pixels splat clamped garbage. The far side carries
+	// a small tolerance instead of a hard edge: sky pinned at far
+	// reprojects marginally past 1.0 on any backward motion, and the
+	// encode below clamps it back onto the far plane.
+	if (target.z < -1.0 || target.z > 1.0 + 1e-4)
 		return;
 
 	vec2 tuv = target.xy * 0.5 + 0.5;

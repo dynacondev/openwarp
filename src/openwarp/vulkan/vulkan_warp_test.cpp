@@ -360,6 +360,35 @@ int main(int argc, char** argv)
 				ok = false;
 			}
 		}
+
+		// Test 6: far-depth passthrough (dynacon 0.995-clip fix). Uniform
+		// 0.997 depth under identity must splat back ~0.997, not the old
+		// min(z, 0.995) collapse. Fails pre-fix (encodes 0.995).
+		{
+			std::vector<uint8_t> farColor(kSize * kSize * 4, 150);
+			std::vector<float> farDepth(kSize * kSize, 0.997f);
+			if (!warp.Upload(farColor.data(), farDepth.data())) {
+				std::cerr << "far Upload failed" << std::endl;
+				return 1;
+			}
+			warp.SetFillMode(0);
+			std::vector<uint8_t> farOut;
+			if (!warp.Warp(identity, proj, identity, proj, 0.0f, farOut, true)) {
+				std::cerr << "far Warp() failed" << std::endl;
+				return 1;
+			}
+			const std::vector<uint32_t>& splat = warp.LastSplatPlane();
+			double meanEnc = 0.0;
+			for (uint32_t w : splat)
+				meanEnc += (double)w / 16777215.0;
+			meanEnc /= (double)splat.size();
+			std::cout << "[far] meanSplatDepth=" << meanEnc << std::endl;
+			if (!(std::abs(meanEnc - 0.997) < 0.001)) {
+				std::cerr << "FAIL: far depth collapsed (0.997 +/- 0.001 required)"
+				          << std::endl;
+				ok = false;
+			}
+		}
 		stbi_write_png((outDir + "/fringe_fill.png").c_str(), kSize, kSize, 4, fringeFill.data(),
 		               kSize * 4);
 	}
