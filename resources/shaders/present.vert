@@ -1,6 +1,6 @@
 // Fullscreen present quad for the --vulkan path: draws the Vulkan-warped
 // result texture to the screen. Part of the Openwarp project (NCSA).
-#version 450
+#version 410 core
 
 layout(location = 0) in vec2 in_pos;
 layout(location = 1) in vec2 in_uv;

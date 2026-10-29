@@ -29,27 +29,27 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS WITH THE
 SOFTWARE.
 */
 
-#version 450 
+#version 410 core
 
-layout(binding = 1) uniform highp sampler2D Texture;
-layout(binding = 2) uniform highp sampler2D _Depth;
+uniform sampler2D Texture;
+uniform sampler2D _Depth;
 
-uniform lowp float u_debugOpacity;
+uniform float u_debugOpacity;
 
-uniform highp mat4x4 u_warpInverseVP;
-uniform highp mat4x4 u_renderPV;
+uniform mat4 u_warpInverseVP;
+uniform mat4 u_renderPV;
 
-uniform mediump vec3 u_warpPos;
+uniform vec3 u_warpPos;
 
-uniform mediump float u_power;
-uniform mediump float u_stepSize;
-uniform mediump float u_depthOffset;
-uniform lowp float u_occlusionThreshold;
-uniform lowp float u_occlusionOffset;
+uniform float u_power;
+uniform float u_stepSize;
+uniform float u_depthOffset;
+uniform float u_occlusionThreshold;
+uniform float u_occlusionOffset;
 
-in mediump vec4 worldspace;
-in mediump vec2 warpUv;
-out mediump vec4 outColor;
+in vec4 worldspace;
+in vec2 warpUv;
+out vec4 outColor;
 
 
 vec3 ndcFromWorld(vec4 worldCoords, mat4x4 PV){

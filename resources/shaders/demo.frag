@@ -1,9 +1,8 @@
-#version 450
+#version 410 core
 
-precision mediump float;
-layout(binding = 0) uniform highp sampler2D main_tex;
-in mediump vec2 uv;
-out lowp vec4 outcolor;
+uniform sampler2D main_tex;
+in vec2 uv;
+out vec4 outcolor;
 
 void main() {
     outcolor = texture(main_tex, uv);

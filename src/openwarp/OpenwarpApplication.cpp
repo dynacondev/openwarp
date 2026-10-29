@@ -114,9 +114,14 @@ OpenwarpApplication::OpenwarpApplication(size_t meshSize, Backend backend_) : ba
     }
     std::cout << "Initializing application window...." << std::endl;
     glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
-    const char* glsl_version = "#version 130";
+    // macOS caps out at OpenGL 4.1 core (no compat profile): request it
+    // explicitly with forward compat, or macOS hands back a 2.1 legacy
+    // context. A 4.1 core request is also satisfiable on Linux Mesa/NVIDIA.
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
+    const char* glsl_version = "#version 410";
 
     window = glfwCreateWindow(WIDTH, HEIGHT, "Openwarp Demo", nullptr, nullptr);
     if(!window) {
@@ -1047,8 +1052,12 @@ int OpenwarpApplication::initGL(){
 
     glfwSwapInterval(useVsync ? 1 : 0);
 
-    glEnable              ( GL_DEBUG_OUTPUT );
-    glDebugMessageCallback( MessageCallback, 0 );
+    // KHR_debug doesn't exist on macOS 4.1 (GLEW leaves the entry point
+    // NULL → calling it segfaults). Only enable where exposed.
+    if (GLEW_KHR_debug) {
+        glEnable              ( GL_DEBUG_OUTPUT );
+        glDebugMessageCallback( MessageCallback, 0 );
+    }
 
     // Create both color and depth render textures
     createRenderTexture(&renderTexture, WIDTH, HEIGHT, false);
@@ -1166,7 +1175,14 @@ int OpenwarpApplication::initGL(){
     glUniformMatrix4fv(demoProjectionAttr, 1, GL_FALSE, (GLfloat*)(projection.data()));
     glUseProgram(meshProgram.program);
     glUniformMatrix4fv(meshProgram.u_renderInverseP, 1, GL_FALSE, (GLfloat*)(projection.inverse().eval().data()));
+    // The 410-core-ported shaders have no layout(binding=): bind the
+    // warp samplers to the units doReprojection uses (1/2) explicitly.
+    // (Demo/present sample unit 0, the default, so need no setup.)
+    glUniform1i(meshProgram.eye_sampler, 1);
+    glUniform1i(meshProgram.depth_sampler, 2);
     glUseProgram(rayProgram.program);
+    glUniform1i(rayProgram.eye_sampler, 1);
+    glUniform1i(rayProgram.depth_sampler, 2);
     glUseProgram(0);
 
     return 0;

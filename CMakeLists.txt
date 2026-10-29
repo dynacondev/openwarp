@@ -72,6 +72,12 @@ target_link_libraries(openwarp PRIVATE glfw)
 
 # glew
 add_definitions(-DGLEW_STATIC)
+# The vendored glew-cmake links AGL.framework on Apple, but Apple removed
+# AGL from the SDK years ago (and GLEW hasn't needed it in ~15 years), so
+# the link fails with `framework 'AGL' not found`. find_library() skips
+# searching when the variable is already cached, so pre-seed it empty and
+# leave the submodule untouched. OpenGL.framework is still found normally.
+set(AGL_LIBRARY "" CACHE FILEPATH "AGL removed from macOS SDK; unused by GLEW" FORCE)
 add_subdirectory(include/glew-cmake EXCLUDE_FROM_ALL)
 target_link_libraries(openwarp PRIVATE libglew_static)
 

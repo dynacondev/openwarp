@@ -29,23 +29,22 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS WITH THE
 SOFTWARE.
 */
 
-#version 450
+#version 410 core
 
-uniform highp mat4x4 u_renderInverseP;
-uniform highp mat4x4 u_renderInverseV;
-uniform highp mat4x4 u_warpVP;
+uniform mat4 u_renderInverseP;
+uniform mat4 u_renderInverseV;
+uniform mat4 u_warpVP;
 
-uniform mediump float bleedRadius;
-uniform mediump float edgeTolerance;
+uniform float bleedRadius;
+uniform float edgeTolerance;
 
 layout(location = 0) in vec3 in_position;
 layout(location = 1) in vec2 in_uv;
 
-layout(binding = 1) uniform highp sampler2D Texture;
-layout(binding = 2) uniform highp sampler2D _Depth;
-out mediump vec4 worldspace;
-out mediump vec2 warpUv;
-out gl_PerVertex { vec4 gl_Position; };
+uniform sampler2D Texture;
+uniform sampler2D _Depth;
+out vec4 worldspace;
+out vec2 warpUv;
 
 
 void main( void )

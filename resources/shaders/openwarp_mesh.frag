@@ -29,16 +29,16 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS WITH THE
 SOFTWARE.
 */
 
-#version 450 
+#version 410 core
 
-layout(binding = 1) uniform highp sampler2D Texture;
-layout(binding = 2) uniform highp sampler2D _Depth;
+uniform sampler2D Texture;
+uniform sampler2D _Depth;
 
-uniform lowp float u_debugOpacity;
+uniform float u_debugOpacity;
 
-in mediump vec4 worldspace;
-in mediump vec2 warpUv;
-out mediump vec4 outColor;
+in vec4 worldspace;
+in vec2 warpUv;
+out vec4 outColor;
 void main()
 {
     outColor.rgba = texture(Texture, warpUv);
