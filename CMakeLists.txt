@@ -49,8 +49,11 @@ add_executable(openwarp
         include/imgui/imgui_demo.cpp
 )
 
-# std::filesystem
-target_link_libraries(openwarp PUBLIC stdc++fs)
+# std::filesystem lives in the standard library on all current toolchains
+# (AppleClang, MSVC, modern GCC/Clang); only pre-9 GCC keeps it in a
+# separate lib. One generator expression covers every platform, no
+# per-OS branches.
+target_link_libraries(openwarp PUBLIC $<$<AND:$<CXX_COMPILER_ID:GNU>,$<VERSION_LESS:$<CXX_COMPILER_VERSION>,9.0>>:stdc++fs>)
 
 # imgui does not support cmake... yet!
 include_directories(include/imgui)
@@ -165,7 +168,7 @@ if(OPENWARP_ENABLE_VULKAN)
             target_include_directories(openwarp-vulkan-test PRIVATE
                 "${CMAKE_CURRENT_SOURCE_DIR}/src/openwarp"
                 include/eigen)
-            target_link_libraries(openwarp-vulkan-test PRIVATE openwarp_vulkan stdc++fs)
+            target_link_libraries(openwarp-vulkan-test PRIVATE openwarp_vulkan $<$<AND:$<CXX_COMPILER_ID:GNU>,$<VERSION_LESS:$<CXX_COMPILER_VERSION>,9.0>>:stdc++fs>)
             set_property(TARGET openwarp-vulkan-test PROPERTY CXX_STANDARD 17)
             add_dependencies(openwarp-vulkan-test openwarp_vulkan_shaders)
         endif()

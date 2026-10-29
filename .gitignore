@@ -32,10 +32,13 @@
 
 # Build folder
 build/
+build-mac/
+build-macos/
 
 # Output folder
 output/
 vulkan-test-out/
+vulkan-test-out-mac*/
 vulkan-dump-*.ppm
 vulkan-dump-*.pgm
 

@@ -9,6 +9,10 @@
 
 #include <algorithm>
 #include <cmath>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
@@ -442,9 +446,38 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 	ii.pApplicationInfo = &app;
 	ii.enabledLayerCount = layerCount;
 	ii.ppEnabledLayerNames = layerCount ? &layer : nullptr;
+	// Portability enumeration (MoltenVK): its devices stay hidden unless
+	// VK_KHR_portability_enumeration is enabled and the enumerate-portability
+	// flag is set. Conformant ICDs (KosmicKrisp) don't advertise it, so enable
+	// it only when present: one path works against either driver, including
+	// systems with both installed.
+	std::vector<const char*> instanceExts;
+	{
+		uint32_t extCount = 0;
+		if (vkEnumerateInstanceExtensionProperties(nullptr, &extCount, nullptr) == VK_SUCCESS &&
+		   extCount > 0) {
+			std::vector<VkExtensionProperties> extProps(extCount);
+			if (vkEnumerateInstanceExtensionProperties(nullptr, &extCount, extProps.data()) ==
+			   VK_SUCCESS) {
+				for (auto& e : extProps) {
+					if (std::strcmp(e.extensionName,
+					                VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0) {
+						instanceExts.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+						break;
+					}
+				}
+			}
+		}
+	}
+	if (!instanceExts.empty())
+		ii.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+	ii.enabledExtensionCount = static_cast<uint32_t>(instanceExts.size());
+	ii.ppEnabledExtensionNames = instanceExts.empty() ? nullptr : instanceExts.data();
 	if (!Check(vkCreateInstance(&ii, nullptr, &s->instance), "vkCreateInstance", error))
 		return false;
-	std::cout << "[vulkan] validation " << (layerCount ? "ON" : "off") << std::endl;
+	std::cout << "[vulkan] validation " << (layerCount ? "ON" : "off") << ", portability enumeration "
+	          << (instanceExts.empty() ? "off (conformant ICDs only)" : "ON (portability ICDs visible)")
+	          << std::endl;
 
 	// Physical device: follow the GL renderer when known (same GPU for
 	// both APIs => frames never cross PCIe), discrete GPU as tiebreak,
@@ -469,6 +502,7 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 		case 0x10de: return has("nvidia") || has("geforce") || has("quadro") || has("tesla");
 		case 0x8086: return has("intel") || has("uhd") || has("iris") || has("hd graphics");
 		case 0x1002: return has("amd") || has("radeon");
+		case 0x106b: return has("apple");
 		default: return false;
 		}
 	};
@@ -495,6 +529,7 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 		forcedIdx = std::atoi(env);
 	int best = -1;
 	int bestScore = -1;
+	uint32_t bestApi = 0;
 	uint32_t bestFamily = 0;
 	for (uint32_t di = 0; di < devCount; di++) {
 		VkPhysicalDeviceProperties props{};
@@ -518,8 +553,10 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 		case VK_PHYSICAL_DEVICE_TYPE_CPU: tn = "cpu"; break;
 		default: break;
 		}
-		std::cout << "[vulkan] device " << di << ": " << props.deviceName << " (" << tn
-		          << ", driver 0x" << std::hex << props.driverVersion << std::dec
+		std::cout << "[vulkan] device " << di << ": " << props.deviceName << " (" << tn << ", api "
+		          << VK_VERSION_MAJOR(props.apiVersion) << "." << VK_VERSION_MINOR(props.apiVersion)
+		          << "." << VK_VERSION_PATCH(props.apiVersion) << ", driver 0x" << std::hex
+		          << props.driverVersion << std::dec
 		          << (fam >= 0 ? ", compute ok" : ", NO compute queue") << ")" << std::endl;
 		if (fam < 0)
 			continue;
@@ -536,8 +573,12 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 			why = "OPENWARP_VK_DEVICE override";
 		}
 		std::cout << "[vulkan]   -> score " << score << " (" << why << ")" << std::endl;
-		if (score > bestScore) {
+		// apiVersion breaks ties: with two ICDs for the same GPU (e.g.
+		// MoltenVK + KosmicKrisp), the higher (conformant) version wins.
+		// Single-device systems (CI lavapipe) are unaffected.
+		if (score > bestScore || (score == bestScore && props.apiVersion > bestApi)) {
 			bestScore = score;
+			bestApi = props.apiVersion;
 			best = static_cast<int>(di);
 			bestFamily = static_cast<uint32_t>(fam);
 		}
@@ -550,19 +591,23 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 		VkPhysicalDeviceProperties props{};
 		vkGetPhysicalDeviceProperties(s->phys, &props);
 		deviceName_ = props.deviceName;
-		std::cout << "[vulkan] using device " << best << ": " << props.deviceName
-		          << " (queue family " << s->queueFamily << ")" << std::endl;
+		std::cout << "[vulkan] using device " << best << ": " << props.deviceName << " (api "
+		          << VK_VERSION_MAJOR(props.apiVersion) << "." << VK_VERSION_MINOR(props.apiVersion)
+		          << "." << VK_VERSION_PATCH(props.apiVersion) << ", driver 0x" << std::hex
+		          << props.driverVersion << std::dec << ", queue family " << s->queueFamily << ")"
+		          << std::endl;
 	}
 
 	// Format sanity: the warp needs these feature bits on OPTIMAL images.
 	{
 		VkFormatProperties fp{};
+	// Note: no blit bits required (frames move via buffer copies, never
+	// blits); linear filtering is needed by the linear color sampler.
 		vkGetPhysicalDeviceFormatProperties(s->phys, VK_FORMAT_R8G8B8A8_UNORM, &fp);
 		if (!(fp.optimalTilingFeatures &
 		      (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
-		       VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
 		       VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)))
-			return Fail(error, "R8G8B8A8_UNORM lacks sampled+storage+blit+linear-filter support");
+			return Fail(error, "R8G8B8A8_UNORM lacks sampled+storage+linear-filter support");
 		vkGetPhysicalDeviceFormatProperties(s->phys, VK_FORMAT_R32_SFLOAT, &fp);
 		if (!(fp.optimalTilingFeatures & (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
 		                                  VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)))
@@ -578,10 +623,36 @@ bool VulkanWarp::Init(uint32_t width, uint32_t height, const std::string& spvDir
 	qi.queueFamilyIndex = s->queueFamily;
 	qi.queueCount = 1;
 	qi.pQueuePriorities = &prio;
+	// Portability-subset devices (MoltenVK) require enabling
+	// VK_KHR_portability_subset at device creation (spec VUID); conformant
+	// ICDs (KosmicKrisp) don't advertise it. Enable when present: one path
+	// covers either driver. (String literal: the EXTENSION_NAME macro lives
+	// behind VK_ENABLE_BETA_EXTENSIONS; the name itself is stable.)
+	const char* portSubset = "VK_KHR_portability_subset";
+	bool havePortSubset = false;
+	{
+		uint32_t devExtCount = 0;
+		if (vkEnumerateDeviceExtensionProperties(s->phys, nullptr, &devExtCount, nullptr) ==
+		       VK_SUCCESS &&
+		    devExtCount > 0) {
+			std::vector<VkExtensionProperties> devExts(devExtCount);
+			if (vkEnumerateDeviceExtensionProperties(s->phys, nullptr, &devExtCount,
+			                                         devExts.data()) == VK_SUCCESS) {
+				for (auto& e : devExts) {
+					if (std::strcmp(e.extensionName, portSubset) == 0) {
+						havePortSubset = true;
+						break;
+					}
+				}
+			}
+		}
+	}
 	VkDeviceCreateInfo di{};
 	di.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
 	di.queueCreateInfoCount = 1;
 	di.pQueueCreateInfos = &qi;
+	di.enabledExtensionCount = havePortSubset ? 1u : 0u;
+	di.ppEnabledExtensionNames = havePortSubset ? &portSubset : nullptr;
 	if (!Check(vkCreateDevice(s->phys, &di, nullptr, &s->device), "vkCreateDevice", error))
 		return false;
 	vkGetDeviceQueue(s->device, s->queueFamily, 0, &s->queue);
